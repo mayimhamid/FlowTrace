@@ -1,0 +1,214 @@
+"""The same GPU checks as test_gpu_paths.py, but on a real CUDA device (skipped without one)."""
+
+import numpy as np
+import pytest
+
+from flowtrace.hardware import backend as backend_mod
+
+
+def _real_gpu():
+    try:
+        import cupy  # noqa: F401
+
+        if getattr(cupy, "__fake__", False):
+            return None
+        be = backend_mod.Backend("cupy")
+        return be
+    except Exception:
+        return None
+
+
+GPU = _real_gpu()
+pytestmark = pytest.mark.skipif(GPU is None, reason="no usable CUDA GPU / CuPy")
+cpu = backend_mod.get_backend("numpy") if GPU is not None else None
+
+
+@pytest.mark.parametrize("preset,params", [("cavity", {"n": 48}), ("natural_convection", {"n": 32}),
+                                           ("cylinder", {"n_per_d": 6}), ("rayleigh_benard", {"nx": 32, "ny": 16}),
+                                           ("channel", {"nx": 64, "ny": 16})])
+def test_mac_gpu_matches_cpu_fp64(preset, params):
+    from flowtrace.structured.case import make_preset
+    from flowtrace.structured.solver import MACSolver
+
+    c = make_preset(preset, **params)
+    c.precision = "fp64"
+    a = MACSolver(c, backend=cpu, dtype=np.float64)
+    b = MACSolver(c, backend=GPU, dtype=np.float64)
+    for _ in range(25):
+        a.step()
+        b.step()
+    assert np.abs(a.U - GPU.to_numpy(b.U)).max() < 1e-9
+    assert np.abs(a.V - GPU.to_numpy(b.V)).max() < 1e-9
+    assert b.max_divergence() < 1e-8
+
+
+@pytest.mark.parametrize("scheme", ["quick", "vanleer", "upwind", "central"])
+@pytest.mark.parametrize("preset,params", [("cavity", {"n": 32}), ("natural_convection", {"n": 24}),
+                                           ("cylinder", {"n_per_d": 5}), ("rayleigh_benard", {"nx": 32, "ny": 16})])
+def test_fused_cuda_kernels_match_vectorised_cupy(preset, params, scheme):
+    from flowtrace.structured import cuda_kernels
+    from flowtrace.structured.case import make_preset
+    from flowtrace.structured.solver import MACSolver
+
+    if not cuda_kernels.available():
+        pytest.skip(f"CUDA kernels not compiled: {cuda_kernels.failure_reason()}")
+    c = make_preset(preset, **params)
+    c.scheme = scheme
+    a = MACSolver(c, backend=GPU, dtype=np.float64)
+    b = MACSolver(c, backend=GPU, dtype=np.float64)
+    b.use_cuda = False
+    assert a.use_cuda
+    for _ in range(15):
+        a.step()
+        b.step()
+    assert float(abs(a.U - b.U).max()) < 1e-11 and float(abs(a.V - b.V).max()) < 1e-11
+    if a.energy:
+        assert float(abs(a.T - b.T).max()) < 1e-11
+
+
+def test_mac_gpu_fp32_consumer_default():
+    from flowtrace.structured.case import lid_driven_cavity
+    from flowtrace.structured.solver import MACSolver, resolve_dtype
+
+    c = lid_driven_cavity(n=64)
+    dt = resolve_dtype(c, GPU)
+    s = MACSolver(c, backend=GPU)
+    for _ in range(100):
+        s.step()
+    assert s.U.dtype == dt
+    assert s.max_divergence() < (1e-3 if dt == np.float32 else 1e-10)
+
+
+def test_separable_solver_gpu():
+    from flowtrace.linalg import Axis1D, SeparableSolver
+
+    axes = [Axis1D(32, 0.1, "neumann", "dirichlet"), Axis1D(24, 0.2, "dirichlet", "dirichlet", "node")]
+    f = np.random.default_rng(0).standard_normal((32, 24))
+    s_gpu = SeparableSolver(axes, GPU)
+    s_cpu = SeparableSolver(axes, cpu)
+    assert np.abs(GPU.to_numpy(s_gpu.solve(GPU.asarray(f), 1.5)) - s_cpu.solve(f, 1.5)).max() < 1e-10
+
+
+def test_simplec_gpu_matches_cpu():
+    from flowtrace.mesh.unstructured import cartesian_mesh_2d
+    from flowtrace.unstructured.case import BoundarySpec, UnstructuredCase
+    from flowtrace.unstructured.simple import SimpleSolver
+
+    m = cartesian_mesh_2d(16, 16, triangulate=True, warp=0.05)
+    # tight inner pressure tolerance: the GPU uses FlowTrace's SA-AMG, the CPU pyamg, so
+    # loosely converged corrections would make the iterates (not the solution) differ
+    c = UnstructuredCase(boundaries={"top": BoundarySpec("wall", velocity=[1.0, 0.0])}, viscosity=0.01,
+                         max_iter=60, tol=1e-12, pressure_tol=1e-9)
+    a = SimpleSolver(m, c, backend=cpu)
+    b = SimpleSolver(m, c, backend=GPU)
+    for _ in range(60):
+        a.step()
+        b.step()
+    assert np.abs(a.fields()["x-velocity"] - b.fields()["x-velocity"]).max() < 1e-6
+
+
+def test_planner_measures_gpu():
+    from flowtrace.hardware.planner import plan_structured
+    from flowtrace.structured.case import lid_driven_cavity
+
+    plan, solver = plan_structured(lid_driven_cavity(n=128), autotune=True, steps=2)
+    assert "cupy" in plan.measured_ms_per_step
+    assert plan.backend in plan.measured_ms_per_step
+
+
+def _fv_pair_gpu(mesh):
+    from flowtrace.native import cuda as native_cuda
+    from flowtrace.unstructured.fvmesh import FVMesh
+
+    if not native_cuda.available():
+        pytest.skip(f"CUDA FV kernels not compiled: {native_cuda.failure_reason()}")
+    fv = FVMesh(mesh, GPU)
+    assert fv.cu is not None
+    return fv
+
+
+@pytest.mark.parametrize("dim3", [False, True], ids=["tri2d", "hex3d"])
+def test_cuda_fv_kernels_match_cupy_reference(dim3):
+    from flowtrace.mesh.unstructured import cartesian_mesh_2d, extrude_to_3d
+
+    m = cartesian_mesh_2d(20, 16, triangulate=True, warp=0.05)
+    if dim3:
+        m = extrude_to_3d(cartesian_mesh_2d(6, 5, warp=0.05), 4, 0.5)
+    fv = _fv_pair_gpu(m)
+    cu = fv.cu
+    xp = GPU.xp
+    rng = np.random.default_rng(0)
+    phi, phib = xp.asarray(rng.standard_normal(fv.nc)), xp.asarray(rng.standard_normal(fv.n_bf))
+    g = xp.asarray(rng.standard_normal((fv.nc, fv.dim)))
+    d = xp.asarray(4 + rng.random(fv.nc))
+    a1, a2 = xp.asarray(-rng.random(fv.n_if)), xp.asarray(-rng.random(fv.n_if))
+    fast = [fv.face_interp(phi), fv.face_interp_vec(g), fv.gradient(phi, phib), fv.gradient_gg(phi, phib, g),
+            fv.matrix(d, a1, a2).toarray()]
+    fv.cu = None  # the vectorised CuPy reference
+    ref = [fv.face_interp(phi), fv.face_interp_vec(g), fv.gradient(phi, phib), fv.gradient_gg(phi, phib, g),
+           fv.matrix(d, a1, a2).toarray()]
+    fv.cu = cu
+    for a, b in zip(fast, ref):
+        a, b = GPU.to_numpy(a), GPU.to_numpy(b)
+        assert np.abs(a - b).max() <= 1e-13 * max(np.abs(b).max(), 1.0)
+
+
+def test_cuda_bicgstab_follows_the_python_algorithm():
+    from flowtrace.linalg.krylov import bicgstab
+    from flowtrace.mesh.unstructured import cartesian_mesh_2d
+
+    fv = _fv_pair_gpu(cartesian_mesh_2d(24, 24, triangulate=True, warp=0.05))
+    xp = GPU.xp
+    rng = np.random.default_rng(2)
+    d = xp.asarray(4 + rng.random(fv.nc))
+    A = fv.matrix(d, xp.asarray(-rng.random(fv.n_if)), xp.asarray(-rng.random(fv.n_if)))
+    b, x0, inv = xp.asarray(rng.standard_normal(fv.nc)), xp.asarray(rng.standard_normal(fv.nc)), 1.0 / d
+    for tol, maxiter in ((0.1, 30), (1e-10, 500)):
+        xr, ir = bicgstab(lambda v: A @ v, b, xp, M=lambda v: inv * v, x0=x0, tol=tol, maxiter=maxiter,
+                          relative_to_initial=True)
+        xc, ic = fv.cu.bicgstab_jacobi(A, b, x0, inv, tol, maxiter)
+        assert (ic.iterations, ic.converged) == (ir.iterations, ir.converged)
+        assert float(xp.abs(xc - xr).max()) <= 1e-12 * float(xp.abs(xr).max())
+
+
+def test_simplec_gpu_with_cuda_kernels_equals_cupy_reference():
+    from flowtrace.mesh.unstructured import cartesian_mesh_2d
+    from flowtrace.unstructured.case import BoundarySpec, UnstructuredCase
+    from flowtrace.unstructured.simple import SimpleSolver
+
+    m = cartesian_mesh_2d(16, 16, triangulate=True, warp=0.05)
+    _fv_pair_gpu(m)
+    c = UnstructuredCase(boundaries={"top": BoundarySpec("wall", velocity=[1.0, 0.0])}, viscosity=0.01,
+                         max_iter=40, tol=0.0)
+    a = SimpleSolver(m, c, backend=GPU)
+    b = SimpleSolver(m, c, backend=GPU)
+    b.fv.cu = None
+    for _ in range(40):
+        a.step()
+        b.step()
+    for k in ("x-velocity", "y-velocity", "pressure"):
+        fa, fb = a.fields()[k], b.fields()[k]
+        assert np.abs(fa - fb).max() <= 1e-9 * max(np.abs(fb).max(), 1.0), k
+
+
+def test_cuda_hllc_kernel_matches_array_path():
+    import cupy as cp
+
+    from flowtrace.compressible import CompressibleCase, CompressibleSolver
+    from flowtrace.mesh.unstructured import cartesian_mesh_2d
+    from flowtrace.native import cuda
+
+    if not cuda.available():
+        pytest.skip(cuda.failure_reason() or "CUDA kernels unavailable")
+    rng = np.random.default_rng(3)
+    nf, dim = 20000, 3
+    W = lambda: np.column_stack([rng.uniform(.1, 2, nf), rng.normal(0, 400, (nf, dim)), rng.uniform(1e4, 3e5, nf)])  # noqa: E731
+    WL, WR = W(), W()
+    n = rng.normal(size=(nf, dim))
+    n /= np.linalg.norm(n, axis=1)[:, None]
+    A = rng.uniform(.1, 2, nf)
+    s = CompressibleSolver(cartesian_mesh_2d(2, 2), CompressibleCase(backend="numpy"))
+    s.dim = dim
+    ref = s._hllc(WL, WR, n) * A[:, None]
+    got = cp.asnumpy(cuda.hllc_flux(cp.asarray(WL), cp.asarray(WR), cp.asarray(n), cp.asarray(A), 1.4))
+    assert np.allclose(got, ref, rtol=1e-11, atol=1e-9 * np.abs(ref).max())

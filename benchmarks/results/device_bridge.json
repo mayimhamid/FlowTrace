@@ -1,0 +1,135 @@
+{
+ "date": "2026-11-12T01:31:07",
+ "cpu": "AMD Ryzen 9 7940HS w/ Radeon 780M Graphics",
+ "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+ "rows": [
+  {
+   "backend": "numpy",
+   "cells": 4096,
+   "serial_iterations": 180,
+   "serial_s": 4.54,
+   "serial_converged": true,
+   "bridge_iterations": 180,
+   "bridge_s": 3.23,
+   "bridge_converged": true,
+   "speedup": 1.41,
+   "max_rel_field_diff": 1.1768364030926014e-11,
+   "chosen": "lanes on the CPU",
+   "steady_ms": {
+    "serial": 27.36,
+    "lanes on the CPU": 12.17,
+    "lanes on the GPU": 44.89,
+    "energy on the GPU, species on the CPU": 31.36,
+    "energy on the CPU, species on the GPU": 30.61,
+    "lanes on the CPU @ 8 CPU threads": 12.52
+   }
+  },
+  {
+   "backend": "numpy",
+   "cells": 16384,
+   "serial_iterations": 380,
+   "serial_s": 50.4,
+   "serial_converged": true,
+   "bridge_iterations": 380,
+   "bridge_s": 15.46,
+   "bridge_converged": true,
+   "speedup": 3.26,
+   "max_rel_field_diff": 2.6670945423697135e-06,
+   "chosen": "lanes on the CPU @ 4 CPU threads",
+   "steady_ms": {
+    "serial": 121.01,
+    "lanes on the CPU": 33.11,
+    "lanes on the GPU": 89.17,
+    "energy on the GPU, species on the CPU": 104.68,
+    "energy on the CPU, species on the GPU": 60.64,
+    "lanes on the CPU @ 8 CPU threads": 30.56,
+    "lanes on the CPU @ 4 CPU threads": 28.33
+   }
+  },
+  {
+   "backend": "numpy",
+   "cells": 65536,
+   "serial_iterations": 841,
+   "serial_s": 221.3,
+   "serial_converged": true,
+   "bridge_iterations": 841,
+   "bridge_s": 124.62,
+   "bridge_converged": true,
+   "speedup": 1.78,
+   "max_rel_field_diff": 6.693767749824985e-07,
+   "chosen": "energy on the CPU, species on the GPU",
+   "steady_ms": {
+    "serial": 227.4,
+    "lanes on the CPU": 118.03,
+    "lanes on the GPU": 135.93,
+    "energy on the GPU, species on the CPU": 208.91,
+    "energy on the CPU, species on the GPU": 114.8,
+    "energy on the CPU, species on the GPU @ 8 CPU threads": 123.89
+   }
+  },
+  {
+   "backend": "cupy",
+   "cells": 4096,
+   "serial_iterations": 180,
+   "serial_s": 13.81,
+   "serial_converged": true,
+   "bridge_iterations": 180,
+   "bridge_s": 7.57,
+   "bridge_converged": true,
+   "speedup": 1.82,
+   "max_rel_field_diff": 5.613087768683379e-08,
+   "chosen": "lanes on the CPU",
+   "steady_ms": {
+    "serial": 71.57,
+    "lanes on the GPU": 113.66,
+    "lanes on the CPU": 33.67,
+    "energy on the CPU, species on the GPU": 71.08,
+    "energy on the GPU, species on the CPU": 65.73,
+    "lanes on the CPU @ 8 CPU threads": 33.62
+   }
+  },
+  {
+   "backend": "cupy",
+   "cells": 16384,
+   "serial_iterations": 380,
+   "serial_s": 36.61,
+   "serial_converged": true,
+   "bridge_iterations": 380,
+   "bridge_s": 19.02,
+   "bridge_converged": true,
+   "speedup": 1.92,
+   "max_rel_field_diff": 2.2773549658958187e-06,
+   "chosen": "lanes on the CPU @ 8 CPU threads",
+   "steady_ms": {
+    "serial": 73.92,
+    "lanes on the GPU": 126.86,
+    "lanes on the CPU": 55.01,
+    "energy on the CPU, species on the GPU": 102.07,
+    "energy on the GPU, species on the CPU": 83.81,
+    "lanes on the CPU @ 8 CPU threads": 40.85,
+    "lanes on the CPU @ 4 CPU threads": 40.09
+   }
+  },
+  {
+   "backend": "cupy",
+   "cells": 65536,
+   "serial_iterations": 841,
+   "serial_s": 72.23,
+   "serial_converged": true,
+   "bridge_iterations": 841,
+   "bridge_s": 74.64,
+   "bridge_converged": true,
+   "speedup": 0.97,
+   "max_rel_field_diff": 3.1436321574187026e-05,
+   "chosen": "serial",
+   "steady_ms": {
+    "serial": 84.92,
+    "lanes on the GPU": 139.01,
+    "lanes on the CPU": 80.82,
+    "energy on the CPU, species on the GPU": 107.5,
+    "energy on the GPU, species on the CPU": 106.46
+   }
+  }
+ ],
+ "reproduce": "python benchmarks/device_bridge.py --sizes 32,64,128 --backends numpy,cupy"
+}
