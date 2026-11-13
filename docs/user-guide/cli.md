@@ -69,8 +69,21 @@ flowtrace solve examples/elbow-mix.msh.txt --auto --units auto --rho 998.2 --mu 
 `--auto` prints one line per decision (Re and the estimated y+ choose the turbulence model, different
 inlet temperatures switch the energy equation on, a skewed mesh gets first-order energy transport so
 that the temperature stays between the boundary values). `--units` is the length unit of the mesh file
-(Fluent: General > Scale); `auto` reads an extent of 20 or more as millimetres, which the log states.
+(Fluent: General > Scale). The default, `auto`, reads an extent of 20 or more as millimetres, scales the
+mesh to metres and says so in the log; give `--units m` for a file that really is that large in metres
+(or a non-dimensional mesh).
 The fluid properties and boundary values are never changed.
+
+### Mesh certificate
+
+```bash
+flowtrace solve examples/elbow-mix.msh.txt --auto --units mm --certify 3 --rho 998.2 --mu 1.003e-3 --bc inf1=inlet:0.4 --bc inf2=inlet:1.2
+```
+
+`--certify` (2 levels) or `--certify 3` refines the mesh after convergence, solves again from the
+first solution and prints every pressure drop, wall force and heat flow with an estimated
+discretisation-error band and a convergence status. The reports and `--export` then describe the
+finest level. Steady 2-D cases; see [Mesh certificate](../theory/certificate.md).
 
 ## Many cases at once: `flowtrace batch`
 

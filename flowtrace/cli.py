@@ -343,7 +343,8 @@ def cmd_solve(args):
                          f"(zones: {', '.join(sorted(zones))})")
     hub = EventHub()
     q = hub.subscribe()
-    spec = {"kind": "unstructured", "mesh_id": "m", "case": case, "auto": args.auto, "mesh_units": args.units}
+    spec = {"kind": "unstructured", "mesh_id": "m", "case": case, "auto": args.auto, "mesh_units": args.units,
+            "certify": args.certify}
     job = Job(spec, hub, args.workdir, meshes={"m": mesh})
     job.start()
     last = 0.0
@@ -553,8 +554,12 @@ def main(argv=None):
     p.add_argument("--auto", action="store_true",
                    help="choose turbulence model, energy equation, species, scalar scheme and iteration budget "
                         "from the mesh and boundary values (every decision is printed)")
-    p.add_argument("--units", default="m", choices=["auto", "m", "cm", "mm", "in"],
-                   help="length unit of the mesh (Fluent: General > Scale); 'auto' guesses it from the extent")
+    p.add_argument("--certify", type=int, nargs="?", const=2, default=0, choices=[0, 2, 3], metavar="LEVELS",
+                   help="mesh certificate: refine the mesh, solve again and report every result with an estimated "
+                        "discretisation-error band (2 levels, or 3 for the observed order); steady 2-D cases")
+    p.add_argument("--units", default="auto", choices=["auto", "m", "cm", "mm", "in"],
+                   help="length unit of the mesh (Fluent: General > Scale); 'auto' (default) reads an extent of 20 or "
+                        "more as millimetres, scales the mesh and says so; give 'm' to keep the file as it is")
     p.set_defaults(func=cmd_solve)
     p = sub.add_parser("compressible", help="density-based solve (HLLC, Euler / NS / k-omega SST) on a Fluent mesh")
     p.add_argument("path")

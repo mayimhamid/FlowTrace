@@ -11,6 +11,19 @@ Release-readiness work. Every claim below has a script, a test or a results file
 and what is still open.
 
 ### Added
+- **Mesh certificate** (`flowtrace solve --certify [2|3]`, the dashboard's "Mesh certificate",
+  `flowtrace/unstructured/certify.py`): after convergence the mesh is refined uniformly
+  (`flowtrace/mesh/refine.py`, any 2-D polygons), solved again from the coarse solution, and every
+  pressure drop, wall force, heat flow and the kinetic energy is reported with a GCI error band, the
+  observed order and a convergence status; the per-cell difference is the field `mesh-error-estimate`.
+  The run continues with the finest level. Steady 2-D cases without periodic or solid zones
+  ([theory](docs/theory/certificate.md), `tests/test_certify.py`).
+- **Mesh unit detected and applied by default** (`--units auto`, the dashboard's "auto-detect"): an
+  extent of 20 or more is read as millimetres and the mesh is scaled to metres, with a warning in the
+  log. Before, the guess was only reported and the file was solved as metres. `--units m` keeps the
+  file as it is. Jobs built from Python without `mesh_units` are unchanged (metres).
+- Dashboard: *Smooth*, *Streamlines* and *Vectors* now work on Fluent (unstructured) 2-D meshes.
+  They were implemented for the built-in structured cases only and did nothing on an uploaded mesh.
 - **Device bridge** (`flowtrace/unstructured/bridge.py`, `UnstructuredCase.lanes`, default `"auto"`):
   energy (+P-1) and passive species are solved concurrently with the flow, each on its own CPU-core
   share, CUDA stream or the other device. Placement and core count are measured on the run itself.
