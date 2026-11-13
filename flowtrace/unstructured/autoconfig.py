@@ -4,7 +4,7 @@
 height, mesh skewness, temperatures and species named on the boundaries) and sets the options a
 careful user would set by hand, returning every decision with its reason so the run log shows it:
 
-* mesh length unit: read as metres like Fluent; a large extent is reported as a possible mm mesh, never applied;
+* mesh length unit: ``units="auto"`` reads an extent of 20 or more as millimetres and scales the mesh (reported);
 * flow regime from Re = rho U L / mu: laminar below 2300, otherwise a turbulence model, chosen by
   the estimated wall y+ (viscous sublayer resolved -> k-omega SST, wall functions -> realizable k-epsilon);
 * energy equation when the boundaries carry different or fixed temperatures;
@@ -110,14 +110,11 @@ def auto_configure(mesh: UnstructuredMesh, case, units: str = "auto") -> Tuple[U
 
     # ---- length unit
     if units == "auto":
-        # Fluent mesh files carry no unit and Fluent reads them as metres. A guess is never applied
-        # (a non-dimensional mesh 80 units wide would become 80 mm and change Re 1000-fold): it is
-        # only reported, and the user sets the unit explicitly.
-        guess, why = guess_units(mesh)
-        units = "m"
-        if guess != "m":
-            notes.append(f"check units: {why.split(':')[0]} would be {guess} if the file was written in {guess}; "
-                         "it is read as metres (as Fluent does). Set the mesh unit to scale it.")
+        # Fluent mesh files carry no unit. The guess is applied and reported; a non-dimensional mesh
+        # more than 20 units wide must be given as units="m".
+        units, why = guess_units(mesh)
+        notes.append(f"auto: mesh unit = {units!r}: {why}" + ("" if units == "m" else
+                     "; set the mesh unit to m if the file really is in metres"))
     if units not in UNIT_FACTORS:
         raise ValueError(f"unknown mesh unit {units!r}; use one of {', '.join(UNIT_FACTORS)}")
     if UNIT_FACTORS[units] != 1.0:

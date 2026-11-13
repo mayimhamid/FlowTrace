@@ -39,8 +39,10 @@ def test_guess_units_reads_a_400_unit_elbow_as_millimetres():
 def test_auto_configure_picks_regime_energy_and_bounded_scalars():
     mesh, _ = read_any_mesh(ELBOW)
     case = _elbow_case(mesh)
-    same, notes, _ = auto_configure(mesh, _elbow_case(mesh))  # a guessed unit is reported, never applied
-    assert same.nodes.max() == 200.0 and any("check units" in n for n in notes)
+    guessed, notes, _ = auto_configure(mesh, _elbow_case(mesh))  # units="auto": the guess is applied and reported
+    assert guessed.nodes.max() == pytest.approx(0.2) and any("mesh unit = 'mm'" in n for n in notes)
+    same, _, _ = auto_configure(mesh, _elbow_case(mesh), units="m")
+    assert same.nodes.max() == 200.0
     scaled, notes, applied = auto_configure(mesh, case, units="mm")
     assert scaled.nodes.max() == pytest.approx(0.2) and mesh.nodes.max() == 200.0
     assert case.turbulence == "k-epsilon-realizable" and case.energy and case.scalar_scheme == "upwind"
