@@ -461,6 +461,7 @@ def register_mesh(app: AppState, raw: bytes, name: str) -> dict:
     """Read an uploaded mesh (.msh/.cas, gzipped or not, or CFF .cas.h5/.msh.h5) and summarise it."""
     from ..mesh.fluent_msh import read_fluent_mesh
     from ..mesh.quality import mesh_quality
+    from ..unstructured.autoconfig import guess_units
     from ..unstructured.case import default_boundaries
 
     t0 = time.perf_counter()
@@ -489,6 +490,9 @@ def register_mesh(app: AppState, raw: bytes, name: str) -> dict:
                              "max_aspect_ratio": q.max_aspect_ratio,
                              "max_non_orthogonality_deg": q.max_non_orthogonality_deg,
                              "warnings": q.warnings, "ok": q.ok}})
+    guess, why = guess_units(mesh)
+    if guess != "m":
+        info["unit_hint"] = {"unit": guess, "why": why}
     app.mesh_info[mid] = info
     return info
 

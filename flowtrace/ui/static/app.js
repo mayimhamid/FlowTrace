@@ -253,6 +253,9 @@ async function renderMeshInfo(info) {
     $("#meshQuality").innerHTML = `<b>${esc(t("quality"))}</b>: ${esc(t("oq"))} ${fmt(q.min_orthogonal_quality, 3)} · ${esc(t("skew"))} ${fmt(q.max_skewness, 3)} · ${esc(t("ar"))} ${fmt(q.max_aspect_ratio, 3)}` +
       (warn || ` · <span style="color:var(--ok)">${esc(t("qualityOk"))}</span>`);
   }
+  if (info.unit_hint) {
+    $("#meshQuality").innerHTML += `<div style="color:var(--warn)">Units: ${esc(info.unit_hint.why)}. FlowTrace reads the file as metres, like Fluent. If it was drawn in ${esc(info.unit_hint.unit)}, set "Mesh length unit" to ${esc(info.unit_hint.unit)} or the Reynolds number will be wrong by orders of magnitude.</div>`;
+  }
   renderZoneTable(info);
   $("#zoneCard").classList.remove("hidden");
   const solids = info.solid_zones || [];
