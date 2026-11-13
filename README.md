@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/logo.svg" alt="FlowTrace logo" width="96" height="96">
+
 # FlowTrace
 
 **A verified, hardware-aware CFD solver and warm-start companion for Ansys Fluent**
