@@ -103,7 +103,7 @@ def cmd_run(args):
             _print_log(ev, args)
         elif t == "residuals" and time.time() - last > 1.0:
             last = time.time()
-            res = "  ".join(f"{k}={v:.2e}" for k, v in ev["scaled"].items())
+            res = "  ".join(f"{k}={v:.2e}" if v is not None else f"{k}=nan" for k, v in ev["scaled"].items())
             print(f"[{ev['label']}] step {ev['step']:>7}  t={ev['t']:.4g}  {res}  {ev['mcells_per_s']:.2f} Mcell/s")
         elif t == "status" and ev["status"] in ("converged", "finished", "stopped", "error"):
             print(f"status: {ev['status']}")
@@ -315,7 +315,7 @@ def cmd_case(args):
             _print_log(ev, args)
         elif ev.get("type") == "residuals" and time.time() - last > 1.0:
             last = time.time()
-            print(f"it {ev['step']:>6}  " + "  ".join(f"{k}={v:.2e}" for k, v in ev["scaled"].items()))
+            print(f"it {ev['step']:>6}  " + "  ".join(f"{k}={v:.2e}" if v is not None else f"{k}=nan" for k, v in ev["scaled"].items()))
         elif ev.get("type") == "status" and ev["status"] in ("converged", "finished", "stopped", "error"):
             print(f"status: {ev['status']}")
     job.join()
@@ -356,7 +356,7 @@ def cmd_solve(args):
             _print_log(ev, args)
         elif ev.get("type") == "residuals" and time.time() - last > 1.0:
             last = time.time()
-            print(f"it {ev['step']:>6}  " + "  ".join(f"{k}={v:.2e}" for k, v in ev["scaled"].items()))
+            print(f"it {ev['step']:>6}  " + "  ".join(f"{k}={v:.2e}" if v is not None else f"{k}=nan" for k, v in ev["scaled"].items()))
         elif ev.get("type") == "status" and ev["status"] in ("converged", "finished", "stopped", "error"):
             print(f"status: {ev['status']}")
     job.join()

@@ -333,6 +333,30 @@ class Job:
             self.log(f"checkpoints: {len(writer.written)} written to {writer.directory} "
                      f"({writer.bytes_written / 1e6:.1f} MB in {writer.seconds:.2f} s, overlapped)")
 
+    def _check_physical(self, solver, ucase, units, unit_guess, unit_why):
+            """Refuse to present a blown-up solution as a result: a finite but absurd velocity field
+            (the run did not converge and the speeds are far above any boundary speed) is a failed run."""
+            if self._stop.is_set() or solver.converged:
+                return
+            try:
+                speed = np.asarray(solver.fields()["velocity-magnitude"], dtype=float)
+            except Exception:
+                return
+            ref = 0.0
+            for b in ucase.boundaries.values():
+                if b.kind == "inlet":
+                    u = b.normal_speed if b.normal_speed is not None else (np.linalg.norm(b.velocity) if b.velocity else 0.0)
+                    ref = max(ref, float(u))
+            if ref <= 0.0:
+                return
+            top = float(np.max(speed)) if speed.size else 0.0
+            if np.isfinite(top) and top <= 50.0 * ref:
+                return
+            why = f"solution is unphysical: maximum speed {top:.3g} m/s against an inlet speed of {ref:g} m/s"
+            if units == "m" and unit_guess != "m":
+                why += f". Likely cause: {unit_why}, read as metres. Set the mesh length unit to {unit_guess}"
+            raise FloatingPointError(why + divergence_context(solver))
+
     def _publish_frame(self, solver, force: bool = False):
         if hasattr(solver, "nx"):
             self.hub.publish(self.structured_frame(solver, self.view_field))
@@ -399,6 +423,9 @@ class Job:
             if not ucase.periodic:
                 ucase.periodic = default_periodic_pairs(mesh, ucase.boundaries)
         units = self.spec.get("mesh_units") or "m"
+        from ..unstructured.autoconfig import guess_units
+
+        unit_guess, unit_why = guess_units(mesh)  # of the file as read, before any scaling
         if self.spec.get("auto") or units != "m":
             from ..unstructured.autoconfig import auto_configure
 
@@ -465,7 +492,17 @@ class Job:
         self.hub.publish({"type": "plan", "plan": plan, "describe": desc})
         if mesh.dim == 2:
             self.hub.publish(self.mesh_geometry_event(mesh))
-        self._loop(solver, label="transient" if ucase.unsteady else "SIMPLE")
+        if units == "m" and unit_guess != "m":
+            self.log(f"Units: {unit_why}. The file is read as metres; if it was drawn in {unit_guess}, set the mesh "
+                     f"length unit to {unit_guess} (otherwise Re and the physics are wrong).", "warn")
+        try:
+            self._loop(solver, label="transient" if ucase.unsteady else "SIMPLE")
+        except FloatingPointError as exc:
+            if units == "m" and unit_guess != "m":
+                raise FloatingPointError(f"{exc}. Likely cause: {unit_why}, read as metres. Set the mesh length unit to "
+                                         f"{unit_guess}") from exc
+            raise
+        self._check_physical(solver, ucase, units, unit_guess, unit_why)
         res = {"iterations": solver.iteration, "converged": solver.converged, "describe": desc,
                "timers": dict(solver.timers), "mass_balance": solver.mass_balance(),
                "stability_rollbacks": list(getattr(solver, "guard_events", []))}
