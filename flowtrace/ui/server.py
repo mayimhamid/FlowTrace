@@ -189,7 +189,9 @@ def make_handler(app: AppState):
             with open(path, "rb") as fh:
                 data = fh.read()
             self.send_response(200)
-            self.send_header("Content-Type", ctype or mimetypes.guess_type(path)[0] or "application/octet-stream")
+            # the registry of a Windows machine may not know .svg, and an <img> needs the right type
+            known = {".svg": "image/svg+xml", ".ico": "image/x-icon"}.get(os.path.splitext(path)[1].lower())
+            self.send_header("Content-Type", ctype or known or mimetypes.guess_type(path)[0] or "application/octet-stream")
             self.send_header("Content-Length", str(len(data)))
             if download_name:
                 self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
@@ -204,6 +206,8 @@ def make_handler(app: AppState):
             try:
                 if path in ("/", "/index.html"):
                     return self._file(os.path.join(STATIC, "index.html"), ctype="text/html; charset=utf-8")
+                if path == "/favicon.ico":  # asked for by browsers whatever the page links to
+                    return self._file(os.path.join(STATIC, "favicon.ico"))
                 if path.startswith("/static/"):
                     fp = os.path.normpath(os.path.join(STATIC, path[len("/static/"):]))
                     if os.path.commonpath([fp, STATIC]) != STATIC or not os.path.isfile(fp):  # stays inside static/
@@ -482,6 +486,8 @@ def register_mesh(app: AppState, raw: bytes, name: str) -> dict:
     app.meshes[mid] = mesh
     app.mesh_files[mid] = (name, raw)
     info = mesh.summary()
+    lo, hi = mesh.bounding_box()
+    info["extent"] = [float(v) for v in (hi - lo)]  # in file units: the dashboard states the real size per unit
     info.update({"id": mid, "read_seconds": round(time.perf_counter() - t0, 3),
                  "volume": q.total_volume, "repaired_faces": q.left_handed_faces_repaired,
                  "boundaries": {k: v.__dict__ for k, v in default_boundaries(mesh).items()},

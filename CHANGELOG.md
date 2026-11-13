@@ -22,6 +22,16 @@ and what is still open.
   extent of 20 or more is read as millimetres and the mesh is scaled to metres, with a warning in the
   log. Before, the guess was only reported and the file was solved as metres. `--units m` keeps the
   file as it is. Jobs built from Python without `mesh_units` are unchanged (metres).
+- Logo and favicon (`flowtrace/ui/static/logo.svg`, `favicon.svg`, `favicon.ico`; `docs/assets/`): three
+  streamlines through a bend with a tracer particle. Used by the dashboard, the README and the docs site.
+- **Dashboard usability.** Results and log are tabs of a resizable panel; a finished run opens with a
+  summary (state, iterations, time, flow model, real domain size) and the list of automatic decisions,
+  and an input error is shown there instead of only in the log. The mesh card states the domain size the
+  chosen length unit gives. Fluid presets (air, water). Boundary rows label and grey out their inputs by
+  boundary type. Long option explanations fold behind a "?". The colour bar names the field and its unit;
+  streamlines on Fluent meshes are evenly spaced. Below 1200 px the residual and performance charts open
+  from a *Monitors* button instead of disappearing. `Cd` is listed only when reference values exist
+  (an immersed body). Ctrl+Enter runs. Reloading the page during a run no longer shows an empty result.
 - Dashboard: *Smooth*, *Streamlines* and *Vectors* now work on Fluent (unstructured) 2-D meshes.
   They were implemented for the built-in structured cases only and did nothing on an uploaded mesh.
 - **Device bridge** (`flowtrace/unstructured/bridge.py`, `UnstructuredCase.lanes`, default `"auto"`):

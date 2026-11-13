@@ -487,6 +487,7 @@ class Job:
                 mesh = scale_mesh(mesh, UNIT_FACTORS[units])
                 notes = [f"mesh scaled by {UNIT_FACTORS[units]:g} ({units} -> m)"]
             self.mesh = mesh
+            self.setup_notes = list(notes)
             for n in notes:
                 self.log(n)
         self.case = ucase
@@ -544,6 +545,7 @@ class Job:
         if units == "m" and unit_guess != "m":
             self.log(f"Units: {unit_why}. The file is read as metres; if it was drawn in {unit_guess}, set the mesh "
                      f"length unit to {unit_guess} (otherwise Re and the physics are wrong).", "warn")
+        t_solve = time.perf_counter()
         try:
             self._loop(solver, label="transient" if ucase.unsteady else "SIMPLE")
         except FloatingPointError as exc:
@@ -581,6 +583,14 @@ class Job:
             self.log(f"diagnostics skipped: {exc}", "warn")
         if certificate is not None:
             res["certificate"] = certificate
+        lo, hi = mesh.bounding_box()
+        # what the run was, in the terms a user set it up in (the dashboard's summary line)
+        res["summary"] = {"seconds": time.perf_counter() - t_solve, "cells": int(mesh.n_cells), "units": units,
+                          "extent": [float(v) for v in (hi - lo)], "turbulence": ucase.turbulence,
+                          "energy": bool(ucase.energy), "algorithm": desc.get("solver"),
+                          "notes": list(getattr(self, "setup_notes", []) or []),
+                          # Cd/Cl mean something only with reference values (set for an immersed body, or by the user)
+                          "reference_values": ucase.ref_velocity != 1.0 or ucase.ref_area != 1.0}
         if ucase.unsteady:
             res["time"] = flow.time
         try:

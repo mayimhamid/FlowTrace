@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FlowTrace Solver</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="alternate icon" href="/static/favicon.ico" sizes="16x16 32x32 48x48">
 <link rel="stylesheet" href="/static/style.css">
 <script>
   /* apply the saved theme before first paint (no flash) */
@@ -13,14 +15,15 @@
 <body>
 <a class="skip" href="#viewport" data-i18n="skip">Skip to the results view</a>
 <header>
-  <div class="brand"><div class="logo" aria-hidden="true">F</div><div>FlowTrace<small data-i18n="tagline">CFD solver · compatible with Ansys Fluent files</small></div></div>
+  <div class="brand"><img class="logo" src="/static/logo.svg" alt="" width="30" height="30"><div>FlowTrace<small data-i18n="tagline">CFD solver · compatible with Ansys Fluent files</small></div></div>
   <div class="case-title" id="caseTitle" data-i18n="noCase">No case running</div>
   <div class="spacer"></div>
   <span class="pill" id="statusPill" role="status" aria-live="polite">idle</span>
+  <button class="btn" id="monBtn" aria-pressed="false">Monitors</button>
   <button class="btn" id="projectsBtn" data-i18n="projects" aria-haspopup="dialog">Projects</button>
   <button class="btn" id="reportBtn" data-i18n="exportReport" disabled>Export report</button>
   <button class="btn icon" id="themeBtn" data-i18n-aria="theme" aria-label="Theme" title="Theme">◐</button>
-  <button class="btn primary" id="runBtn"><span aria-hidden="true">▶ </span><span data-i18n="run">Run</span></button>
+  <button class="btn primary" id="runBtn" title="Run (Ctrl+Enter)"><span aria-hidden="true">▶ </span><span data-i18n="run">Run</span></button>
   <button class="btn danger" id="stopBtn" disabled><span aria-hidden="true">■ </span><span data-i18n="stop">Stop</span></button>
 </header>
 
@@ -60,6 +63,7 @@
             <input type="file" id="meshFile" class="hidden" accept=".msh,.gz,.cas,.h5,.txt" aria-hidden="true" tabindex="-1">
             <div id="meshSummary" class="desc" aria-live="polite"></div>
             <div id="meshQuality" class="desc"></div>
+            <div id="unitNote" class="note hidden" aria-live="polite"></div>
             <label class="field"><span data-i18n="meshUnits">Mesh length unit</span><select id="meshUnits"><option value="auto">auto-detect</option><option value="m">m (as in the file)</option><option value="mm">mm</option><option value="cm">cm</option><option value="in">in</option></select></label>
             <label class="field"><span data-i18n="autoOpts">Auto-detect solver options</span><input type="checkbox" id="autoOpts" checked></label>
             <div class="desc" data-i18n="autoHelp">Chooses turbulence model, energy equation, species, scalar scheme and iteration budget from the mesh and boundary values; every decision is written to the log.</div>
@@ -76,6 +80,10 @@
           </div>
           <div class="card hidden" id="propsCard">
             <h3 data-i18n="materials">Material &amp; models</h3>
+            <label class="field"><span>Fluid</span><select id="matPreset">
+              <option value="">Custom</option><option value="air">Air (20 °C)</option><option value="water">Water (20 °C)</option>
+              <option value="unit">Non-dimensional (ρ = 1, μ = 1/Re)</option>
+            </select></label>
             <label class="field"><span data-i18n="density">Density</span><input type="number" id="uDensity" value="1" step="any"></label>
             <label class="field"><span data-i18n="viscosity">Dynamic viscosity</span><input type="number" id="uViscosity" value="0.01" step="any"></label>
             <label class="field"><span data-i18n="turbulence">Turbulence model</span><select id="uTurb">
@@ -201,11 +209,25 @@
       <canvas class="colorbar" id="colorbar" aria-hidden="true"></canvas>
       <div class="hud hidden" id="hud"></div>
       <div class="hover" id="hover"></div>
-      <div class="empty" id="empty"><div class="big" data-i18n="ready">Ready.</div><div data-i18n="readyHelp">Pick a case or load a Fluent mesh, then press Run. FlowTrace measures your hardware and places every stage where it runs fastest.</div></div>
+      <div class="cb-title hidden" id="cbTitle"></div>
+      <div class="empty" id="empty"><div class="big" data-i18n="ready">Ready.</div>
+        <ol class="steps">
+          <li><b>Choose a case.</b> A built-in one, or drop a Fluent mesh on the <i>Fluent mesh</i> tab.</li>
+          <li><b>Set the fluid and the boundaries.</b> Hover a boundary to see it on the mesh.</li>
+          <li><b>Press Run</b> (Ctrl+Enter). Results, balances and the log appear below.</li>
+        </ol>
+      </div>
     </div>
-    <div class="bottom">
-      <div class="console" id="console" role="log" data-i18n-aria="logLabel" aria-label="Solver log"></div>
-      <div class="validation" id="validation" aria-live="polite"><div class="muted" data-i18n="valHelp">Validation against reference data appears here when a run finishes.</div></div>
+    <div class="bottom" id="bottom">
+      <div class="resize" id="bottomResize" role="separator" aria-orientation="horizontal" aria-label="Resize the results panel" tabindex="0"></div>
+      <div class="btabs" role="tablist" aria-label="Results and log">
+        <button role="tab" id="btab-results" aria-controls="validation" aria-selected="true" data-b="results" class="active">Results</button>
+        <button role="tab" id="btab-log" aria-controls="console" aria-selected="false" data-b="log">Log <span class="count hidden" id="logBadge"></span></button>
+        <div class="spacer"></div>
+        <span class="muted" id="runSummary"></span>
+      </div>
+      <div class="validation" id="validation" role="tabpanel" aria-labelledby="btab-results" aria-live="polite"><div class="muted" data-i18n="valHelp">Results appear here when a run finishes.</div></div>
+      <div class="console hidden" id="console" role="log" data-i18n-aria="logLabel" aria-label="Solver log"></div>
     </div>
   </main>
 

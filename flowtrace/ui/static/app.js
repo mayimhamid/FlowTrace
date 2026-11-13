@@ -253,9 +253,7 @@ async function renderMeshInfo(info) {
     $("#meshQuality").innerHTML = `<b>${esc(t("quality"))}</b>: ${esc(t("oq"))} ${fmt(q.min_orthogonal_quality, 3)} · ${esc(t("skew"))} ${fmt(q.max_skewness, 3)} · ${esc(t("ar"))} ${fmt(q.max_aspect_ratio, 3)}` +
       (warn || ` · <span style="color:var(--ok)">${esc(t("qualityOk"))}</span>`);
   }
-  if (info.unit_hint) {
-    $("#meshQuality").innerHTML += `<div style="color:var(--warn)">Units: ${esc(info.unit_hint.why)}. With "Mesh length unit" on auto-detect the mesh is scaled from ${esc(info.unit_hint.unit)} to metres. If the file really is in metres, choose "m (as in the file)": the Reynolds number differs by orders of magnitude between the two.</div>`;
-  }
+  updateUnitNote();
   renderZoneTable(info);
   $("#zoneCard").classList.remove("hidden");
   const solids = info.solid_zones || [];
@@ -393,20 +391,91 @@ function bindMesh3DControls() {
     if (e.clientX - r.left < 220 && z >= 0 && z < g.names.length) { g.hidden = g.hidden || new Set(); g.hidden.has(z) ? g.hidden.delete(z) : g.hidden.add(z); draw(); }
   });
 }
+const UNIT_M = { m: 1, cm: 0.01, mm: 0.001, in: 0.0254 };
+const fmtLen = (v) => (v >= 1 ? `${+v.toPrecision(3)} m` : v >= 0.01 ? `${+(v * 100).toPrecision(3)} cm` : `${+(v * 1000).toPrecision(3)} mm`);
+/* What the chosen length unit makes of this mesh: its real size, said before the run. */
+function updateUnitNote() {
+  const el = $("#unitNote"), info = S.meshInfo;
+  if (!info || !info.extent) { el.classList.add("hidden"); return; }
+  const sel = $("#meshUnits").value, guess = info.unit_hint ? info.unit_hint.unit : "m";
+  const unit = sel === "auto" ? guess : sel;
+  const size = info.extent.slice(0, info.dim).map((v) => fmtLen(v * UNIT_M[unit])).join(" × ");
+  const raw = +Math.max(...info.extent).toPrecision(4);
+  let msg = `Domain size: <b>${esc(size)}</b>`;
+  if (sel === "auto") msg += guess === "m" ? " (file read as metres)" : ` — the file spans ${raw} units, read as <b>${esc(guess)}</b>. Wrong? Choose the unit above.`;
+  else if (sel === "m" && guess !== "m") msg += ` — the file spans ${raw} units and looks like ${esc(guess)}; as metres the Reynolds number is ${Math.round(1 / UNIT_M[guess]).toLocaleString()}× larger.`;
+  el.innerHTML = msg; el.classList.toggle("warn", sel === "m" && guess !== "m"); el.classList.remove("hidden");
+}
+const MATERIALS = { air: [1.204, 1.825e-5, 0.0257, 1006], water: [998.2, 1.003e-3, 0.6, 4182], unit: [1, 0.01, 0.01, 1] };
+function initSetupHelpers() {
+  $("#meshUnits").addEventListener("change", updateUnitNote);
+  const ids = ["uDensity", "uViscosity", "uConductivity", "uCp"];
+  $("#matPreset").addEventListener("change", (e) => { const m = MATERIALS[e.target.value]; if (m) ids.forEach((id, i) => { $("#" + id).value = m[i]; }); });
+  ids.forEach((id) => $("#" + id).addEventListener("input", () => { $("#matPreset").value = ""; }));
+  // long explanations fold behind a "?" next to the option they explain
+  $$("label.field + .desc").forEach((d, i) => {
+    if (d.id) return; // live output (estimates), not help text
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "help-btn"; b.textContent = "?"; d.id = `help${i}`;
+    b.setAttribute("aria-expanded", "false"); b.setAttribute("aria-controls", d.id); b.setAttribute("aria-label", "Explain this option");
+    b.addEventListener("click", (e) => { e.preventDefault(); const open = d.classList.toggle("hidden"); b.setAttribute("aria-expanded", open ? "false" : "true"); });
+    d.classList.add("hidden"); $("span", d.previousElementSibling).appendChild(b);
+  });
+  $("#zoneTable").addEventListener("change", (e) => { const tr = e.target.closest("tr[data-zone]"); if (tr && e.target.dataset.k === "kind") zoneRowHints(tr); });
+  document.addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && !$("#runBtn").disabled) { e.preventDefault(); run(); } });
+  $("#monBtn").addEventListener("click", () => { const on = document.body.classList.toggle("show-monitors"); $("#monBtn").setAttribute("aria-pressed", on ? "true" : "false"); drawResiduals(); drawMonitor(); });
+  // results / log tabs and the height of the panel
+  $$(".btabs button").forEach((b) => b.addEventListener("click", () => showBottom(b.dataset.b)));
+  const bottom = $("#bottom"), grip = $("#bottomResize");
+  const setH = (h) => { const v = Math.max(90, Math.min(window.innerHeight * 0.75, h)); bottom.style.setProperty("--bottom-h", `${v}px`); store.set("ft-bottom-h", String(Math.round(v))); S.cellPaths = null; draw(); };
+  const saved = +store.get("ft-bottom-h"); if (saved > 0) bottom.style.setProperty("--bottom-h", `${saved}px`);
+  grip.addEventListener("pointerdown", (e) => {
+    grip.setPointerCapture(e.pointerId); const y0 = e.clientY, h0 = bottom.getBoundingClientRect().height;
+    const move = (ev) => setH(h0 + y0 - ev.clientY);
+    const up = () => { grip.removeEventListener("pointermove", move); grip.removeEventListener("pointerup", up); };
+    grip.addEventListener("pointermove", move); grip.addEventListener("pointerup", up);
+  });
+  grip.addEventListener("keydown", (e) => { const h = bottom.getBoundingClientRect().height; if (e.key === "ArrowUp") { e.preventDefault(); setH(h + 30); } else if (e.key === "ArrowDown") { e.preventDefault(); setH(h - 30); } });
+}
+function showBottom(which) {
+  $$(".btabs button").forEach((b) => { const on = b.dataset.b === which; b.classList.toggle("active", on); b.setAttribute("aria-selected", on ? "true" : "false"); });
+  $("#validation").classList.toggle("hidden", which !== "results"); $("#console").classList.toggle("hidden", which !== "log");
+  if (which === "log") { const c = $("#console"); c.scrollTop = c.scrollHeight; }
+}
+function showError(msg) {
+  showBottom("results");
+  $("#validation").innerHTML = `<div class="headline"><span class="state err">Could not run</span></div><div class="errbox">${esc(msg)}</div><div class="desc">The full log is on the Log tab.</div>`;
+}
+/* Which numbers a boundary of this kind takes: captions, placeholders and greyed-out inputs. */
+function zoneRowHints(tr) {
+  const kind = $("select[data-k=kind]", tr).value, val = $("input[data-k=val]", tr), th = $("input[data-k=therm]", tr);
+  const caps = $$(".caps span", tr);
+  const H = {
+    inlet: ["Speed [m/s]", "1.5 or u,v", "Temperature", "T=300"],
+    wall: ["Velocity u,v", "at rest", "Thermal", "T=350, q=500"],
+    outlet: ["Pressure [Pa]", "0", "Backflow T", "T=300"],
+    pressure: ["Pressure [Pa]", "0", "Temperature", "T=300"],
+  }[kind];
+  val.disabled = th.disabled = !H;
+  caps[1].textContent = H ? H[0] : "—"; caps[2].textContent = H ? H[2] : "—";
+  val.placeholder = H ? H[1] : ""; th.placeholder = H ? H[3] : "";
+}
 function renderZoneTable(info) {
   const t = $("#zoneTable");
   const kinds = ["wall", "inlet", "outlet", "pressure", "symmetry", "periodic"];
   const dim = info.dim;
   t.innerHTML = info.zones.filter((z) => z.kind === "face" && z.type !== "interior").map((z) => {
     const b = info.boundaries[z.name] || { kind: "wall" };
-    return `<tr data-zone="${esc(z.name)}"><td>
+    return `<tr data-zone="${esc(z.name)}" class="zone-row"><td>
       <div class="row" style="justify-content:space-between"><b>${esc(z.name)}</b><span class="muted">${esc(z.type)} · ${z.count} faces</span></div>
-      <div class="row" style="margin-top:4px">
-        <select data-k="kind" style="width:96px">${kinds.map((k) => `<option ${k === b.kind ? "selected" : ""}>${k}</option>`).join("")}</select>
-        <input type="text" data-k="val" title="inlet: normal speed or u,v${dim === 3 ? ",w" : ""}; wall: wall velocity u,v${dim === 3 ? ",w" : ""}; outlet: gauge pressure" placeholder="speed / u,v / p" value="${b.kind === "inlet" ? (b.normal_speed ?? 1) : ""}">
-        <input type="text" data-k="therm" title="T=value (fixed temperature) or q=value (heat flux into the domain)" placeholder="T=… / q=…" value="">
+      <div class="caps"><span>Type</span><span></span><span></span></div>
+      <div class="ins">
+        <select data-k="kind" aria-label="${esc(z.name)} type">${kinds.map((k) => `<option ${k === b.kind ? "selected" : ""}>${k}</option>`).join("")}</select>
+        <input type="text" data-k="val" aria-label="${esc(z.name)} value" title="inlet: normal speed or u,v${dim === 3 ? ",w" : ""}; wall: wall velocity u,v${dim === 3 ? ",w" : ""}; outlet: gauge pressure" value="${b.kind === "inlet" ? (b.normal_speed ?? 1) : ""}">
+        <input type="text" data-k="therm" aria-label="${esc(z.name)} thermal" title="T=value (fixed temperature) or q=value (heat flux into the domain); species as name=value" value="">
       </div></td></tr>`;
   }).join("");
+  $$("tr[data-zone]", t).forEach(zoneRowHints);
 }
 function zoneSpecs() {
   const out = {};
@@ -495,11 +564,12 @@ async function run() {
     const spec = buildSpec();
     resetRunView();
     await post("/api/run", spec);
-  } catch (e) { logLine({ level: "error", msg: e.message }); }
+  } catch (e) { logLine({ level: "error", msg: e.message }); showError(e.message); }
 }
 function resetRunView() {
   S.res = { keys: [], series: {}, x: [], labels: [] }; S.mon = []; S.resCount = 0;
   $("#console").innerHTML = ""; $("#validation").innerHTML = `<div class="muted">${esc(t("running"))}</div>`;
+  S.logCount = { warn: 0, error: 0 }; $("#logBadge").classList.add("hidden"); $("#runSummary").textContent = ""; S.runStart = performance.now();
   $("#planTable").innerHTML = `<tr><td class="muted">${esc(t("measuring"))}</td></tr>`;
   drawResiduals(); drawMonitor();
 }
@@ -527,8 +597,9 @@ function onStatus(ev) {
   $("#runBtn").disabled = busy; $("#stopBtn").disabled = !busy;
   $("#reportBtn").disabled = !["converged", "finished", "stopped"].includes(st);
   if (ev.name) $("#caseTitle").textContent = ev.name;
-  if (ev.result) onResult(ev.result);
-  if (st === "error") logLine({ level: "error", msg: ev.error });
+  if (ev.result && !busy && Object.keys(ev.result).length) onResult(ev.result); // a page reloaded mid-run has no result yet
+  if (st === "error") { logLine({ level: "error", msg: ev.error }); showError(ev.error || "The run failed."); }
+  if (busy && S.runStart) $("#runSummary").textContent = ev.label || "";
 }
 function onPlan(ev) {
   const p = ev.plan;
@@ -584,7 +655,38 @@ function onFrame(ev) {
   $("#frameInfo").textContent = ev.mesh === "structured" ? `${ev.grid[0]}×${ev.grid[1]} · step ${ev.step}` : `${ev.cells.toLocaleString()} cells · it ${ev.step}`;
   draw();
 }
+function resultHeadline(res) {
+  const sm = res.summary || {}, conv = res.converged, stopped = $("#statusPill").dataset.status === "stopped";
+  const n = res.iterations !== undefined ? res.iterations : res.steps;
+  const unfinished = conv === false && res.iterations !== undefined && res.time === undefined; // a steady run out of iterations
+  const state = stopped ? ["warn", "Stopped"] : conv ? ["ok", "Converged"] : unfinished ? ["warn", "Not converged"] : ["ok", "Finished"];
+  const facts = [];
+  if (n !== undefined) facts.push(["iterations", Number(n).toLocaleString()]);
+  if (sm.seconds !== undefined) facts.push(["time", sm.seconds < 60 ? `${sm.seconds.toFixed(1)} s` : `${(sm.seconds / 60).toFixed(1)} min`]);
+  if (sm.cells) facts.push(["cells", sm.cells.toLocaleString()]);
+  if (sm.turbulence) facts.push(["flow", sm.turbulence]);
+  if (sm.extent) facts.push(["size", sm.extent.slice(0, 2).map(fmtLen).join(" × ")]);
+  if (sm.units && sm.units !== "m") facts.push(["file unit", sm.units]);
+  if ((res.stability_rollbacks || []).length) facts.push(["recoveries", res.stability_rollbacks.length]);
+  const notes = (sm.notes || []).map((x) => `<li>${esc(x.replace(/^auto: /, ""))}</li>`).join("");
+  const hint = unfinished && !stopped ? `<div class="note warn">The residual target was not reached within the iteration limit. Raise <b>Max iterations</b> (Solver tab) or check the boundary values; the numbers below are of an unfinished solution.</div>` : "";
+  $("#runSummary").textContent = `${state[1]}${n !== undefined ? ` · ${Number(n).toLocaleString()} it` : ""}`;
+  return `<div class="headline"><span class="state ${state[0]}">${state[1]}</span><div class="facts">${facts.map(([k, v]) => `<span class="fact">${esc(k)} <b>${esc(v)}</b></span>`).join("")}</div></div>${hint}` +
+    (notes ? `<details class="decisions"><summary>What FlowTrace decided for this run (${sm.notes.length})</summary><ul>${notes}</ul></details>` : "");
+}
 function onResult(res) {
+  renderResult(res);
+  // one scrolling column per group instead of one long list
+  const box = $("#validation"); const head = $$(".headline, .note, details.decisions", box);
+  const rest = Array.from(box.children).filter((el) => !head.includes(el));
+  if (rest.length) { const grid = document.createElement("div"); grid.className = "results-grid"; let col = null;
+    rest.forEach((el) => { if (!col || el.dataset.group) { col = document.createElement("div"); grid.appendChild(col); } col.appendChild(el); });
+    box.appendChild(grid); }
+  $$("table.grid", box).forEach((tb) => { const w = document.createElement("div"); w.className = "scroll-x"; tb.replaceWith(w); w.appendChild(tb); });
+  box.insertAdjacentHTML("afterbegin", resultHeadline(res));
+  showBottom("results");
+}
+function renderResult(res) {
   const v = res.validation;
   if (v && v.checks) {
     $("#validation").innerHTML = v.checks.map((c) => `<div class="check"><span class="badge ${c.pass ? "pass" : "check"}">${c.pass ? "PASS" : "CHECK"}</span><span>${esc(c.name)}${c.reference !== undefined && c.reference !== null ? ` <span class="muted">(ref ${c.reference})</span>` : ""}</span><span class="val">${fmt(c.value, 4)} <span class="muted">${esc(c.unit || "")}</span></span></div>`).join("");
@@ -603,17 +705,18 @@ function onResult(res) {
     const rows = Object.entries(cert.quantities).map(([n, q]) => `<tr><td>${esc(n)}</td><td class="num">${fmt(q.value, 5)}</td><td class="num">± ${fmt(q.band, 2)}</td>` +
       `<td class="num">${(100 * q.relative).toPrecision(2)} %</td><td><span class="badge ${weak(q) ? "check" : "pass"}">${esc(q.status)}</span>${q.order !== null && q.order !== undefined ? ` <span class="muted">order ${fmt(q.order, 3)}</span>` : ""}</td></tr>`).join("");
     const fe = cert.velocity_field_error;
-    $("#validation").insertAdjacentHTML("beforeend", `<div style="margin-top:8px"><b>${esc(t("certTitle"))}</b> <span class="muted">${cert.cells.map((c) => c.toLocaleString()).join(" → ")} cells</span></div>` +
+    $("#validation").insertAdjacentHTML("beforeend", `<div data-group="1" style="margin-top:8px"><b>${esc(t("certTitle"))}</b> <span class="muted">${cert.cells.map((c) => c.toLocaleString()).join(" → ")} cells</span></div>` +
       `<table class="grid"><tr><th>Result (finest mesh)</th><th>Value</th><th>Error band</th><th>%</th><th>Mesh convergence</th></tr>${rows}</table>` +
       `<div class="desc">Velocity field of the coarser mesh: mean error ${(100 * fe.mean).toPrecision(2)} %, worst cell ${(100 * fe.max).toPrecision(2)} % of the largest speed. The field “mesh-error-estimate” shows where.</div>` +
       cert.notes.map((n) => `<div class="desc">${esc(n)}</div>`).join(""));
   }
   const wr = res.wall_report;
   if (wr && Object.keys(wr).length) {
+    const refs = !res.summary || res.summary.reference_values; // Cd needs reference values (an immersed body)
     const rows = Object.entries(wr).map(([z, r]) => `<tr><td>${esc(z)}</td><td class="num">${fmt(r.force_total[0], 4)}</td><td class="num">${fmt(r.force_total[1], 4)}</td>` +
-      `<td class="num">${fmt(r.cd, 4)}</td><td class="num">${fmt(r.cf_avg, 4)}</td><td class="num">${fmt(r.yplus_avg, 3)} / ${fmt(r.yplus_max, 3)}</td>` +
+      `${refs ? `<td class="num">${fmt(r.cd, 4)}</td>` : ""}<td class="num">${fmt(r.cf_avg, 4)}</td><td class="num">${fmt(r.yplus_avg, 3)} / ${fmt(r.yplus_max, 3)}</td>` +
       `<td class="num">${r.heat_flow_conv !== undefined ? fmt(r.heat_flow_conv, 4) : "–"}${r.heat_flow_rad !== undefined ? " + " + fmt(r.heat_flow_rad, 4) + " rad" : ""}</td></tr>`).join("");
-    $("#validation").insertAdjacentHTML("beforeend", `<div style="margin-top:8px"><b>Wall report</b></div><table class="grid"><tr><th>Wall</th><th>Fx</th><th>Fy</th><th>Cd</th><th>Cf avg</th><th>y+ avg/max</th><th>Q</th></tr>${rows}</table>`);
+    $("#validation").insertAdjacentHTML("beforeend", `<div data-group="1" style="margin-top:8px"><b>Wall report</b></div><table class="grid"><tr><th>Wall</th><th>Fx [N/m]</th><th>Fy [N/m]</th>${refs ? "<th>Cd</th>" : ""}<th>Cf avg</th><th>y+ avg/max</th><th>Q [W/m]</th></tr>${rows}</table>`);
   }
   const pm = res.periodic_mass_flow;
   if (pm && Object.keys(pm).length) {
@@ -628,6 +731,11 @@ function logLine(ev) {
   div.className = ev.level === "error" ? "error" : ev.level === "warn" ? "warn" : m.startsWith("[plan]") ? "plan" : m.startsWith("[validation]") ? "val" : "";
   div.textContent = m;
   c.appendChild(div);
+  if (ev.level === "warn" || ev.level === "error") {
+    const n = S.logCount || (S.logCount = { warn: 0, error: 0 }); n[ev.level]++;
+    const b = $("#logBadge"); b.textContent = n.warn + n.error; b.classList.remove("hidden"); b.classList.toggle("err", n.error > 0);
+    b.title = `${n.error} errors, ${n.warn} warnings`;
+  }
   while (c.childNodes.length > 400) c.removeChild(c.firstChild);
   c.scrollTop = c.scrollHeight;
 }
@@ -747,17 +855,16 @@ function sampleVel(f, gx, gy) {
 function drawStreamlines(ctx, f, vr) {
   const nx = f.vnx, ny = f.vny;
   const sx = vr.w / nx, sy = vr.h / ny; // px per velocity cell
-  const occN = 2, occ = new Uint8Array(nx * occN * ny * occN);
+  const oc = f.sep || 0.5, ow = Math.ceil(nx / oc) + 1, occ = new Uint8Array(ow * (Math.ceil(ny / oc) + 1)); // occupancy cells of `oc` grid units
   const ar = (f.lx / nx) / (f.ly / ny); // physical cell aspect
   ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 0.9;
   const seeds = []; const ns = 26;
   for (let a = 0; a < ns; a++) for (let b = 0; b < ns; b++) seeds.push([(a + 0.5) / ns * nx, (b + 0.5) / ns * ny]);
   for (const [sx0, sy0] of seeds) {
-    const ox = Math.floor(sx0 * occN), oy = Math.floor(sy0 * occN);
-    if (occ[oy * nx * occN + ox]) continue;
+    if (occ[Math.floor(sy0 / oc) * ow + Math.floor(sx0 / oc)]) continue;
     for (const dir of [1, -1]) {
       let x = sx0, y = sy0; const pts = [[x, y]]; const mine = [];
-      for (let k = 0; k < 400; k++) {
+      for (let k = 0; k < (f.steps || 400); k++) {
         const a = sampleVel(f, x, y); if (!a) break;
         let [u, v] = a; u /= ar; const m = Math.hypot(u, v); if (m < 1e-12) break;
         const h = 0.35 * dir;
@@ -766,7 +873,7 @@ function drawStreamlines(ctx, f, vr) {
         let [u2, v2] = b; u2 /= ar; const m2 = Math.hypot(u2, v2); if (m2 < 1e-12) break;
         x += h * u2 / m2; y += h * v2 / m2;
         if (x < 0 || y < 0 || x > nx || y > ny) break;
-        const cx = Math.floor(x * occN), cy = Math.floor(y * occN), ci = cy * nx * occN + cx;
+        const ci = Math.floor(y / oc) * ow + Math.floor(x / oc);
         if (occ[ci] && !mine.includes(ci)) break;
         if (!mine.includes(ci)) { mine.push(ci); if (mine.length > 6) occ[mine[mine.length - 7]] = 1; }
         pts.push([x, y]);
@@ -842,7 +949,7 @@ function drawUnstructured(ctx, W, H, f, cmap) {
     const lx = x1 - x0, ly = y1 - y0, m = 150 / Math.max(lx, ly);
     const vnx = Math.max(8, Math.round(lx * m)), vny = Math.max(8, Math.round(ly * m));
     const [u, v] = rasterCells(g, [f.u, f.v], vnx, vny, (x) => (x - x0) / lx * vnx, (y) => (y - y0) / ly * vny);
-    const vf = { vnx, vny, lx, ly, u, v };
+    const vf = { vnx, vny, lx, ly, u, v, sep: 3, steps: 1500 };
     if (wantS) drawStreamlines(ctx, vf, vr);
     if (wantV) drawVectors(ctx, vf, vr);
   }
@@ -881,10 +988,15 @@ function rasterCells(g, chans, W, H, X, Y) {
   }
   return out;
 }
+const FIELD_UNITS = { pressure: "Pa", temperature: "K", "turb-kinetic-energy": "m²/s²", "turb-diss-rate": "m²/s³", "specific-diss-rate": "1/s",
+  "viscosity-turb": "Pa·s", "wall-distance": "m", "y-plus": "", "viscosity-ratio": "", "mesh-error-estimate": "fraction of max speed", vorticity: "1/s" };
 function drawColorbar(f, cmap) {
   const cv = $("#colorbar"); const [ctx, W, H] = setupCanvas(cv);
   ctx.clearRect(0, 0, W, H);
+  const title = $("#cbTitle"); title.classList.toggle("hidden", !f);
   if (!f) return;
+  const unit = FIELD_UNITS[f.field] !== undefined ? FIELD_UNITS[f.field] : (/velocity/.test(f.field) ? "m/s" : "");
+  title.textContent = f.field + (unit ? ` [${unit}]` : "");
   const bw = 14, x = 4;
   for (let y = 0; y < H - 20; y++) { const k = 3 * Math.round(255 * (1 - y / (H - 21))); ctx.fillStyle = `rgb(${cmap[k]},${cmap[k + 1]},${cmap[k + 2]})`; ctx.fillRect(x, 10 + y, bw, 1); }
   ctx.strokeStyle = cssVar("--line"); ctx.strokeRect(x, 10, bw, H - 20);
@@ -918,8 +1030,8 @@ function uiState() {
   $$("#presetParams input").forEach((i) => { params[i.dataset.param] = i.value; });
   const vals = {};
   ["tEnd", "maxSteps", "steadyTol", "mode", "scheme", "cfl", "poisson", "algorithm", "uScheme", "relaxU", "relaxP", "maxIter", "uTol",
-    "backend", "precision", "ckpt", "uDensity", "uViscosity", "uConductivity", "uCp", "uTurb"].forEach((id) => { vals[id] = $("#" + id).value; });
-  ["fmg", "uEnergy"].forEach((id) => { vals[id] = $("#" + id).checked; });
+    "backend", "precision", "ckpt", "uDensity", "uViscosity", "uConductivity", "uCp", "uTurb", "meshUnits", "certify", "matPreset"].forEach((id) => { vals[id] = $("#" + id).value; });
+  ["fmg", "uEnergy", "autoOpts"].forEach((id) => { vals[id] = $("#" + id).checked; });
   return { source: S.source, preset: $("#presetSelect").value, params, vals, zones: S.source === "unstructured" ? zoneSpecs() : null };
 }
 async function refreshProjects() {
@@ -956,6 +1068,7 @@ async function openProject(name) {
         const val = spec.normal_speed ?? (spec.velocity ? spec.velocity.join(",") : (spec.pressure ?? ""));
         $("input[data-k=val]", tr).value = val;
         if (spec.thermal && spec.thermal !== "adiabatic") $("input[data-k=therm]", tr).value = `${spec.thermal === "flux" ? "q" : "T"}=${spec.value}`;
+        zoneRowHints(tr);
       }
     }
     $("#projectMsg").textContent = `${t("projectOpened")} ${r.project.name}`;
@@ -987,7 +1100,7 @@ async function restoreState() {
 }
 function init() {
   applyI18n();
-  initTabs(); initMeshUpload(); initHover(); bindMesh3DControls(); initZoneHighlight(); initBigCharts();
+  initTabs(); initMeshUpload(); initHover(); bindMesh3DControls(); initZoneHighlight(); initBigCharts(); initSetupHelpers();
   $("#themeBtn").addEventListener("click", cycleTheme);
   $("#projectsBtn").addEventListener("click", () => { $("#projectMsg").textContent = ""; refreshProjects().catch((e) => { $("#projectMsg").textContent = e.message; }); $("#projectsDialog").showModal(); });
   $("#saveProjectBtn").addEventListener("click", saveProject);
