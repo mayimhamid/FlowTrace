@@ -10,6 +10,7 @@ window.FT_I18N = {
     enlarge: "Click to enlarge", chartResiduals: "Residual history", chartMonitor: "Monitor history", chartPerf: "Performance",
     chartHintRes: "Hover for exact values · wheel to zoom the iteration range · double-click to reset", iteration: "Iteration", first: "First", last: "Last", min: "Min", max: "Max", mean: "Mean", orders: "Orders dropped", series: "Series", stage: "Stage",
     seconds: "Seconds", share: "Share",
+    certify: "Mesh certificate", certTitle: "Mesh certificate", certifyHelp: "After the run converges, refines the mesh, solves again from the first solution and reports every result with an estimated discretisation-error band, plus a map of where the mesh is too coarse. Steady 2-D cases.",
     meshUnits: "Mesh length unit", autoOpts: "Auto-detect solver options", autoHelp: "Chooses turbulence model, energy equation, species, scalar scheme and iteration budget from the mesh and boundary values; every decision is written to the log.",
     meshTitle: "Fluent mesh (.msh / .cas / .cas.h5 / .txt)", dropMesh: "Drop a Fluent mesh here or click to choose",
     bcs: "Boundary conditions", solids: "Solid zones (conjugate heat transfer)", materials: "Material & models",

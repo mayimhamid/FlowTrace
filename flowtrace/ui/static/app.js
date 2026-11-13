@@ -254,7 +254,7 @@ async function renderMeshInfo(info) {
       (warn || ` · <span style="color:var(--ok)">${esc(t("qualityOk"))}</span>`);
   }
   if (info.unit_hint) {
-    $("#meshQuality").innerHTML += `<div style="color:var(--warn)">Units: ${esc(info.unit_hint.why)}. FlowTrace reads the file as metres, like Fluent. If it was drawn in ${esc(info.unit_hint.unit)}, set "Mesh length unit" to ${esc(info.unit_hint.unit)} or the Reynolds number will be wrong by orders of magnitude.</div>`;
+    $("#meshQuality").innerHTML += `<div style="color:var(--warn)">Units: ${esc(info.unit_hint.why)}. With "Mesh length unit" on auto-detect the mesh is scaled from ${esc(info.unit_hint.unit)} to metres. If the file really is in metres, choose "m (as in the file)": the Reynolds number differs by orders of magnitude between the two.</div>`;
   }
   renderZoneTable(info);
   $("#zoneCard").classList.remove("hidden");
@@ -480,7 +480,7 @@ function buildSpec() {
   $$("#solidTable tr[data-solid]").forEach((tr) => { solids[tr.dataset.solid] = { conductivity: +$("input[data-k=k]", tr).value, source: +$("input[data-k=q]", tr).value }; });
   return {
     kind: "unstructured", mesh_id: S.meshId, checkpoint_seconds: +$("#ckpt").value || 0,
-    auto: $("#autoOpts").checked, mesh_units: $("#meshUnits").value,
+    auto: $("#autoOpts").checked, mesh_units: $("#meshUnits").value, certify: +$("#certify").value || 0,
     case: {
       name: S.meshInfo.name, boundaries: zoneSpecs(), density: +$("#uDensity").value, viscosity: +$("#uViscosity").value,
       energy: $("#uEnergy").checked || Object.keys(solids).length > 0 || $("#radModel").value !== "off",
@@ -574,7 +574,7 @@ function scheduleCharts() { if (chartPending) return; chartPending = true; reque
 function onFrame(ev) {
   S.frame = ev;
   if (ev.mesh === "structured") ev.values = b64f32(ev.data), ev.u = b64f32(ev.u), ev.v = b64f32(ev.v);
-  else ev.values = b64f32(ev.data);
+  else { ev.values = b64f32(ev.data); if (ev.u && ev.v) { ev.u = b64f32(ev.u); ev.v = b64f32(ev.v); } }
   const sel = $("#fieldSelect");
   if (sel.options.length !== ev.fields.length || Array.from(sel.options).some((o, i) => o.value !== ev.fields[i])) {
     sel.innerHTML = ev.fields.map((f) => `<option value="${f}">${f}</option>`).join("");
@@ -596,6 +596,17 @@ function onResult(res) {
   }
   if (res.continuity_local_max !== undefined) {
     $("#validation").insertAdjacentHTML("beforeend", `<div class="check"><span class="muted">Local continuity (max cell imbalance / mean face flux)</span><span class="val">${Number(res.continuity_local_max).toExponential(2)}</span></div>`);
+  }
+  const cert = res.certificate;
+  if (cert && cert.quantities) {
+    const weak = (q) => q.status === "oscillating" || q.status === "not converging" || q.status === "slow" || q.status === "irregular";
+    const rows = Object.entries(cert.quantities).map(([n, q]) => `<tr><td>${esc(n)}</td><td class="num">${fmt(q.value, 5)}</td><td class="num">± ${fmt(q.band, 2)}</td>` +
+      `<td class="num">${(100 * q.relative).toPrecision(2)} %</td><td><span class="badge ${weak(q) ? "check" : "pass"}">${esc(q.status)}</span>${q.order !== null && q.order !== undefined ? ` <span class="muted">order ${fmt(q.order, 3)}</span>` : ""}</td></tr>`).join("");
+    const fe = cert.velocity_field_error;
+    $("#validation").insertAdjacentHTML("beforeend", `<div style="margin-top:8px"><b>${esc(t("certTitle"))}</b> <span class="muted">${cert.cells.map((c) => c.toLocaleString()).join(" → ")} cells</span></div>` +
+      `<table class="grid"><tr><th>Result (finest mesh)</th><th>Value</th><th>Error band</th><th>%</th><th>Mesh convergence</th></tr>${rows}</table>` +
+      `<div class="desc">Velocity field of the coarser mesh: mean error ${(100 * fe.mean).toPrecision(2)} %, worst cell ${(100 * fe.max).toPrecision(2)} % of the largest speed. The field “mesh-error-estimate” shows where.</div>` +
+      cert.notes.map((n) => `<div class="desc">${esc(n)}</div>`).join(""));
   }
   const wr = res.wall_report;
   if (wr && Object.keys(wr).length) {
@@ -802,14 +813,73 @@ function drawUnstructured(ctx, W, H, f, cmap) {
   const edges = $("#showEdges").checked;
   const lo = f ? f.min : 0, hi = f ? f.max : 1, inv = hi > lo ? 255 / (hi - lo) : 0;
   ctx.lineWidth = 0.5;
-  for (let c = 0; c < g.cells; c++) {
+  if (f && f.values.length !== g.cells) f = null; // a frame of another refinement level, before its geometry arrived
+  if (f && $("#smooth").checked) {
+    // node-interpolated shading: every cell as a fan of triangles (centroid, corner, corner)
+    const dpr = window.devicePixelRatio || 1, q = Math.min(dpr, Math.sqrt(2.5e6 / Math.max(1, W * H)));
+    const rw = Math.max(1, Math.round(W * q)), rh = Math.max(1, Math.round(H * q));
+    const [img] = rasterCells(g, [f.values], rw, rh, (x) => (vr.x + (x - x0) * vr.s) * rw / W, (y) => (vr.y + vr.h - (y - y0) * vr.s) * rh / H);
+    off.width = rw; off.height = rh;
+    const octx = off.getContext("2d"); const id = octx.createImageData(rw, rh); const d = id.data;
+    for (let i = 0; i < rw * rh; i++) {
+      const v = img[i]; if (v !== v) continue;
+      const k = 3 * Math.max(0, Math.min(255, Math.round((v - lo) * inv)));
+      d[4 * i] = cmap[k]; d[4 * i + 1] = cmap[k + 1]; d[4 * i + 2] = cmap[k + 2]; d[4 * i + 3] = 255;
+    }
+    octx.putImageData(id, 0, 0);
+    ctx.imageSmoothingEnabled = true; ctx.drawImage(off, 0, 0, W, H);
+    if (edges) { ctx.strokeStyle = "rgba(0,0,0,0.35)"; for (let c = 0; c < g.cells; c++) ctx.stroke(S.cellPaths.paths[c]); }
+  } else for (let c = 0; c < g.cells; c++) {
     if (f) { const k = 3 * Math.max(0, Math.min(255, Math.round((f.values[c] - lo) * inv))); ctx.fillStyle = `rgb(${cmap[k]},${cmap[k + 1]},${cmap[k + 2]})`; }
     else ctx.fillStyle = cssVar("--panel-2");
     ctx.fill(S.cellPaths.paths[c]);
     if (edges || !f) { ctx.strokeStyle = f ? "rgba(0,0,0,0.35)" : cssVar("--muted"); ctx.stroke(S.cellPaths.paths[c]); }
   }
   if (!f) $("#empty").classList.add("hidden");
+  const wantS = $("#showStream").checked, wantV = $("#showVectors").checked;
+  if (f && f.u && f.u.length === g.cells && (wantS || wantV)) {
+    // velocity on a regular grid over the bounding box (NaN outside the domain), then as for structured cases
+    const lx = x1 - x0, ly = y1 - y0, m = 150 / Math.max(lx, ly);
+    const vnx = Math.max(8, Math.round(lx * m)), vny = Math.max(8, Math.round(ly * m));
+    const [u, v] = rasterCells(g, [f.u, f.v], vnx, vny, (x) => (x - x0) / lx * vnx, (y) => (y - y0) / ly * vny);
+    const vf = { vnx, vny, lx, ly, u, v };
+    if (wantS) drawStreamlines(ctx, vf, vr);
+    if (wantV) drawVectors(ctx, vf, vr);
+  }
   drawZoneHighlight2D(ctx, g, vr, x0, y0);
+}
+/* Cell values -> node values (mean of the cells around a node) -> linear interpolation over each cell's
+   triangle fan, sampled at the centres of a W x H grid. X, Y map mesh coordinates to grid coordinates.
+   Returns one Float32Array per channel, NaN outside the mesh. */
+function rasterCells(g, chans, W, H, X, Y) {
+  const nn = g.nodes.length / 2, nch = chans.length;
+  const cnt = new Float32Array(nn); const nodeV = chans.map(() => new Float32Array(nn));
+  for (let c = 0; c < g.cells; c++) for (let k = g.ptr[c]; k < g.ptr[c + 1]; k++) { const n = g.loops[k]; cnt[n]++; for (let q = 0; q < nch; q++) nodeV[q][n] += chans[q][c]; }
+  for (let n = 0; n < nn; n++) if (cnt[n]) for (let q = 0; q < nch; q++) nodeV[q][n] /= cnt[n];
+  const px = new Float32Array(nn), py = new Float32Array(nn);
+  for (let n = 0; n < nn; n++) { px[n] = X(g.nodes[2 * n]); py[n] = Y(g.nodes[2 * n + 1]); }
+  const out = chans.map(() => new Float32Array(W * H).fill(NaN));
+  const eps = -1e-3;
+  for (let c = 0; c < g.cells; c++) {
+    const s = g.ptr[c], e = g.ptr[c + 1]; let cx = 0, cy = 0;
+    for (let k = s; k < e; k++) { cx += px[g.loops[k]]; cy += py[g.loops[k]]; }
+    cx /= e - s; cy /= e - s;
+    for (let k = s; k < e; k++) {
+      const a = g.loops[k], b = g.loops[k + 1 < e ? k + 1 : s];
+      const ax = px[a], ay = py[a], bx = px[b], by = py[b];
+      const den = (ay - by) * (cx - bx) + (bx - ax) * (cy - by); if (Math.abs(den) < 1e-12) continue;
+      const i0 = Math.max(0, Math.floor(Math.min(cx, ax, bx) - 0.5)), i1 = Math.min(W - 1, Math.ceil(Math.max(cx, ax, bx) - 0.5));
+      const j0 = Math.max(0, Math.floor(Math.min(cy, ay, by) - 0.5)), j1 = Math.min(H - 1, Math.ceil(Math.max(cy, ay, by) - 0.5));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+        const x = i + 0.5, y = j + 0.5;
+        const w0 = ((ay - by) * (x - bx) + (bx - ax) * (y - by)) / den; if (w0 < eps) continue;
+        const w1 = ((by - cy) * (x - bx) + (cx - bx) * (y - by)) / den; if (w1 < eps) continue;
+        const w2 = 1 - w0 - w1; if (w2 < eps) continue;
+        for (let q = 0; q < nch; q++) out[q][j * W + i] = w0 * chans[q][c] + w1 * nodeV[q][a] + w2 * nodeV[q][b];
+      }
+    }
+  }
+  return out;
 }
 function drawColorbar(f, cmap) {
   const cv = $("#colorbar"); const [ctx, W, H] = setupCanvas(cv);

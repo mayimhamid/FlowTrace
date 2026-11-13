@@ -382,13 +382,55 @@ class Job:
 
     def unstructured_frame(self, solver, field: Optional[str] = None) -> dict:
         f = solver.fields()
+        for k, v in (getattr(self, "extra_fields", None) or {}).items():
+            if len(v) == solver.nc:
+                f[k] = v
         names = list(f.keys())
         field = field if field in names else ("temperature" if "temperature" in f else "velocity-magnitude")
         vals = f[field]
         lo, hi = _display_range(field, vals)
-        return {"type": "frame", "mesh": "unstructured", "field": field, "fields": names,
-                "data": _b64(vals), "min": lo, "max": hi,
-                "step": solver.iteration, "t": solver.iteration, "cells": solver.nc}
+        ev = {"type": "frame", "mesh": "unstructured", "field": field, "fields": names,
+              "data": _b64(vals), "min": lo, "max": hi,
+              "step": solver.iteration, "t": solver.iteration, "cells": solver.nc}
+        if "x-velocity" in f and "y-velocity" in f and "z-velocity" not in f:
+            ev["u"], ev["v"] = _b64(f["x-velocity"]), _b64(f["y-velocity"])  # streamlines and vectors
+        return ev
+
+    def _certify(self, solver, levels: int):
+        """Mesh certificate (see unstructured/certify.py): refine, re-solve, put error bands on the
+        reported numbers. Returns (finest solver, certificate) or (solver, None) when it does not apply."""
+        from ..unstructured.certify import certify, format_certificate
+        from ..unstructured.simple import SimpleSolver
+
+        why = None
+        if not isinstance(solver, SimpleSolver):
+            why = "conjugate (fluid + solid) cases are not refined yet"
+        elif solver.dim != 2:
+            why = "uniform refinement is implemented for 2-D meshes"
+        elif solver.case.unsteady:
+            why = "it applies to steady runs"
+        elif solver.mesh.periodic:
+            why = "meshes with periodic zones are not refined yet"
+        elif not solver.converged:
+            why = "the run did not reach its residual target; converge it first"
+        if why:
+            self.log(f"Mesh certificate skipped: {why}", "warn")
+            return solver, None
+
+        def run(s, level):
+            self.solver = s
+            self.mesh = s.mesh
+            self.extra_fields = {}
+            self.hub.publish(self.mesh_geometry_event(s.mesh))
+            self._loop(s, label=f"certificate level {level}")
+
+        cert = certify(solver, levels=max(2, min(3, levels)), run=run, log=self.log)
+        fine = cert.pop("solver")
+        cert.pop("mesh")
+        self.extra_fields = {"mesh-error-estimate": cert.pop("error_map")}
+        for line in format_certificate(cert):
+            self.log("[certificate] " + line.strip())
+        return fine, cert
 
     # ---------------- unstructured (Fluent mesh) ----------------
     def _run_unstructured(self, mesh=None, ucase=None):
@@ -426,6 +468,13 @@ class Job:
         from ..unstructured.autoconfig import guess_units
 
         unit_guess, unit_why = guess_units(mesh)  # of the file as read, before any scaling
+        if units == "auto":
+            units = unit_guess
+            if units != "m":
+                self.log(f"Units: {unit_why}; the mesh is scaled to metres. If the file really is in metres, set the "
+                         "mesh length unit to m.", "warn")
+            else:
+                self.log(f"Units: {unit_why}")
         if self.spec.get("auto") or units != "m":
             from ..unstructured.autoconfig import auto_configure
 
@@ -503,6 +552,13 @@ class Job:
                                          f"{unit_guess}") from exc
             raise
         self._check_physical(solver, ucase, units, unit_guess, unit_why)
+        certificate = None
+        if self.spec.get("certify") and not self._stop.is_set():
+            coarse_iterations = solver.iteration
+            solver, certificate = self._certify(solver, int(self.spec["certify"]))
+            if certificate is not None:
+                self.solver, self.mesh, mesh = solver, solver.mesh, solver.mesh
+                certificate["coarse_iterations"] = coarse_iterations
         res = {"iterations": solver.iteration, "converged": solver.converged, "describe": desc,
                "timers": dict(solver.timers), "mass_balance": solver.mass_balance(),
                "stability_rollbacks": list(getattr(solver, "guard_events", []))}
@@ -523,6 +579,8 @@ class Job:
             self.log(_diagnostics_line(res["diagnostics"]))
         except Exception as exc:  # diagnostics must never fail a finished run
             self.log(f"diagnostics skipped: {exc}", "warn")
+        if certificate is not None:
+            res["certificate"] = certificate
         if ucase.unsteady:
             res["time"] = flow.time
         try:

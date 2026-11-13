@@ -29,6 +29,13 @@ this repository.
 
 ## Highlights
 
+* **Mesh certificate: every result with an error band.** A converged residual does not say how far
+  the answer is from the mesh-independent one. With `--certify` (dashboard: *Mesh certificate*)
+  FlowTrace refines the mesh, solves again from the first solution and reports each pressure drop,
+  wall force and heat flow as `value ± estimated discretisation error`, with the observed order and
+  a map of where the mesh is too coarse. Quantities that do not converge with the mesh (singular
+  corners) are flagged instead of being given a small band. Steady 2-D cases
+  ([how it works and what it does not do](docs/theory/certificate.md)).
 * **Verified, not only validated.** Manufactured solutions on warped meshes show second-order
   convergence for velocity and temperature on quads and triangles. They also exposed a real
   pressure-force bug that the cavity validation had missed. Every SIMPLE/SIMPLEC run also
@@ -96,6 +103,9 @@ flowtrace solve duct.msh --bc inlet=inlet:1.0:T300 --bc heater=wall::q5000 --ene
 
 # Built-in structured cases; the planner measures CPU vs GPU first
 flowtrace run cavity --re 1000 --n 512
+
+# The same, with an error band on every reported number (refine, re-solve, Richardson/GCI)
+flowtrace solve examples/elbow-mix.msh.txt --auto --units mm --certify 3     --bc inf1=inlet:0.4 --bc inf2=inlet:1.2 --rho 998.2 --mu 1.003e-3
 
 # Check a mesh against Fluent's quality recommendations
 flowtrace quality my_case.msh

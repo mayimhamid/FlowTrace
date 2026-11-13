@@ -68,6 +68,7 @@ nav:
       - Structured MAC solver: theory/mac.md
       - Pressure-based unstructured solver: theory/simplec.md
       - Solver diagnostics: theory/diagnostics.md
+      - Mesh certificate: theory/certificate.md
       - Turbulence models: theory/turbulence.md
       - Density-based compressible solver: theory/compressible.md
       - CHT, rotating frames, periodic zones: theory/zones.md

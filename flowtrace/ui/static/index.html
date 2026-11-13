@@ -60,9 +60,11 @@
             <input type="file" id="meshFile" class="hidden" accept=".msh,.gz,.cas,.h5,.txt" aria-hidden="true" tabindex="-1">
             <div id="meshSummary" class="desc" aria-live="polite"></div>
             <div id="meshQuality" class="desc"></div>
-            <label class="field"><span data-i18n="meshUnits">Mesh length unit</span><select id="meshUnits"><option value="m">m (as in the file)</option><option value="mm">mm</option><option value="cm">cm</option><option value="in">in</option><option value="auto">check only</option></select></label>
+            <label class="field"><span data-i18n="meshUnits">Mesh length unit</span><select id="meshUnits"><option value="auto">auto-detect</option><option value="m">m (as in the file)</option><option value="mm">mm</option><option value="cm">cm</option><option value="in">in</option></select></label>
             <label class="field"><span data-i18n="autoOpts">Auto-detect solver options</span><input type="checkbox" id="autoOpts" checked></label>
             <div class="desc" data-i18n="autoHelp">Chooses turbulence model, energy equation, species, scalar scheme and iteration budget from the mesh and boundary values; every decision is written to the log.</div>
+            <label class="field"><span data-i18n="certify">Mesh certificate</span><select id="certify"><option value="0">off</option><option value="2">2 levels (4× cells)</option><option value="3">3 levels (16× cells, observed order)</option></select></label>
+            <div class="desc" data-i18n="certifyHelp">After the run converges, refines the mesh, solves again from the first solution and reports every result with an estimated discretisation-error band, plus a map of where the mesh is too coarse. Steady 2-D cases.</div>
           </div>
           <div class="card hidden" id="zoneCard">
             <h3 data-i18n="bcs">Boundary conditions</h3>
