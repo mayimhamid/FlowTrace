@@ -60,10 +60,16 @@ class BoundarySpec:
     rotation: Optional[dict] = None
     emissivity: float = 1.0
     species: Optional[Dict[str, float]] = None
+    heat_transfer_coefficient: float = 0.0  # W/(m2 K), ambient temperature in value
 
     def __post_init__(self):
         if self.kind not in KINDS:
             raise ValueError(f"unknown boundary kind {self.kind!r}")
+        if self.thermal == "convection":
+            from math import isfinite
+
+            if self.kind != "wall" or not isfinite(self.heat_transfer_coefficient) or self.heat_transfer_coefficient < 0:
+                raise ValueError("thermal convection needs a wall and a finite non-negative heat transfer coefficient")
 
 
 @dataclass
@@ -87,7 +93,7 @@ class UnstructuredCase:
     # non-orthogonal correctors for pressure; None = auto (0 if <= 5 deg, 2 if > 5 deg)
     n_non_ortho: Optional[int] = None
     relax_T: float = 1.0
-    scheme: str = "second-order"  # upwind | second-order | skew-symmetric
+    scheme: str = "second-order"  # upwind | second-order | venkatakrishnan | skew-symmetric
     # Energy and species inherit the upwind scheme, or use second-order
     # upwind when momentum is skew-symmetric.
     scalar_scheme: Optional[str] = None  # None | upwind | second-order
@@ -146,8 +152,22 @@ class UnstructuredCase:
     # --- reports ---
     ref_velocity: float = 1.0
     ref_area: float = 1.0
+    cell_order: str = "input"  # input | rcm
+    venkat_k: float = 0.3
+    rhie_chow: str = "legacy"  # legacy | consistent
+    gpu_krylov: str = "auto"  # auto | device
 
     def __post_init__(self):
+        if self.precision not in ("fp32", "fp64", "mixed"):
+            raise ValueError("precision must be fp32, fp64 or mixed")
+        if self.gpu_krylov not in ("auto", "device"):
+            raise ValueError("gpu_krylov must be auto or device")
+        if self.rhie_chow not in ("legacy", "consistent"):
+            raise ValueError("rhie_chow must be legacy or consistent")
+        if not self.venkat_k >= 0.0:
+            raise ValueError("venkat_k must be non-negative")
+        if self.cell_order not in ("input", "rcm"):
+            raise ValueError("cell_order must be input or rcm")
         self.boundaries = {k: (BoundarySpec(**v) if isinstance(v, dict) else v) for k, v in self.boundaries.items()}
         if self.algorithm.upper() not in ("SIMPLE", "SIMPLEC"):
             raise ValueError("algorithm must be SIMPLE or SIMPLEC")

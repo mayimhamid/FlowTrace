@@ -179,8 +179,10 @@ def write_pyfluent_script(path: str, mesh_file: str, ip_file: Optional[str], dim
             bc_lines.append(f'    bc.pressure_outlet["{name}"].momentum.gauge_pressure.value = {p_out}')
     thermal = [f"{name}: {spec.get('thermal', 'temperature') if spec.get('kind') != 'inlet' else 'inlet temperature'}"
                f" = {spec.get('value', 0.0)}"
+               + (f", film coefficient = {spec.get('heat_transfer_coefficient', 0.0)} W/(m2 K)"
+                  if spec.get("thermal") == "convection" else "")
                for name, spec in (boundaries or {}).items()
-               if energy and (spec.get("thermal") in ("temperature", "flux") or spec.get("kind") == "inlet")]
+               if energy and (spec.get("thermal") in ("temperature", "flux", "convection") or spec.get("kind") == "inlet")]
     bc_block = "\n".join(bc_lines) if bc_lines else "    pass"
     if turbulence == "k-omega-sst":
         viscous_block = ('s.setup.models.viscous.model = "k-omega"\n'

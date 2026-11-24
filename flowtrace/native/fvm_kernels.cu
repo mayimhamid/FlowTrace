@@ -71,6 +71,44 @@ extern "C" __global__ void ft_gg_gradient(i64 nc, i64 dim, const int* iptr, cons
     for (i64 a = 0; a < dim; ++a) out[c * dim + a] = s[a] * iv;
 }
 
+// Gather one complete deferred transport RHS per cell. Interior terms use
+// identical face arithmetic on the two rows and opposite incidence signs.
+extern "C" __global__ void ft_transport_rhs(
+        i64 nc, i64 dim, const int* iptr, const int* iidx, const double* sign,
+        const int* bptr, const int* bidx, const i64* P, const i64* N, const double* w,
+        const double* T, const double* dP, const double* dN, const double* flux,
+        const double* boundary_flux, const double* gamma, double uniform_gamma, int variable_gamma,
+        const double* phi, const double* grad, const double* phib, const double* Db,
+        const double* limiter, int order, const double* extra, int has_extra, double* out) {
+    i64 c = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nc) return;
+    double rhs = has_extra ? extra[c] : 0.0;
+    for (int j = bptr[c]; j < bptr[c + 1]; ++j) {
+        i64 f = bidx[j];
+        rhs += (Db[f] + fmax(-boundary_flux[f], 0.0)) * phib[f];
+    }
+    for (int j = iptr[c]; j < iptr[c + 1]; ++j) {
+        i64 f = iidx[j], p = P[f], n = N[f];
+        bool owner_up = flux[f] >= 0.0;
+        i64 u = owner_up ? p : n;
+        const double* offset = owner_up ? dP : dN;
+        double cross = 0.0, jump = 0.0;
+        for (i64 k = 0; k < dim; ++k) {
+            i64 q = f * dim + k;
+            cross += (w[f] * grad[p * dim + k] + (1.0 - w[f]) * grad[n * dim + k]) * T[q];
+            if (order) jump += grad[u * dim + k] * offset[q];
+        }
+        if (order == 1) {
+            double bounded = fmin(fmax(phi[u] + jump, fmin(phi[p], phi[n])), fmax(phi[p], phi[n]));
+            jump = bounded - phi[u];
+        } else if (order == 2) {
+            jump *= limiter[u];
+        }
+        rhs += sign[j] * ((variable_gamma ? gamma[f] : uniform_gamma) * cross - flux[f] * jump);
+    }
+    out[c] = rhs;
+}
+
 // assembly: data must be zero on entry; one thread per cell writes its diagonal and adds the
 // coefficients of the faces it owns (P side) or neighbours (N side). Cell-centric, so no atomics.
 extern "C" __global__ void ft_assemble(i64 nc, const int* iptr, const int* iidx, const double* isgn,

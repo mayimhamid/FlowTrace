@@ -27,15 +27,13 @@ def _batched_inverse(G: np.ndarray) -> np.ndarray:
 
     ``np.linalg.inv`` is several times faster than the SVD behind ``pinv`` and gives the
     same result for the non-singular least-squares matrices of an ordinary mesh."""
+    scale = np.trace(G, axis1=1, axis2=2) / G.shape[-1]
+    good = np.linalg.det(G) > 1e-12 * scale ** G.shape[-1]
     out = np.empty_like(G)
-    cond_ok = np.abs(np.linalg.det(G)) > 1e-300
-    if cond_ok.any():
-        out[cond_ok] = np.linalg.inv(G[cond_ok])
-        bad = ~cond_ok | ~np.isfinite(out).all(axis=(1, 2))
-    else:
-        bad = cond_ok == cond_ok
-    if bad.any():
-        out[bad] = np.linalg.pinv(G[bad])
+    if good.any():
+        out[good] = np.linalg.inv(G[good])
+    if not good.all():
+        out[~good] = np.linalg.pinv(G[~good], rcond=1e-12, hermitian=True)
     return out
 
 
@@ -58,8 +56,11 @@ class _LeanGeometry:
 
 
 class FVMesh:
-    def __init__(self, mesh: UnstructuredMesh, backend, dtype=np.float64):
+    def __init__(self, mesh: UnstructuredMesh, backend, dtype=np.float64, *, cell_order="input"):
+        if cell_order == "rcm":
+            mesh = mesh.reordered_rcm()
         self.mesh = mesh
+        self.perm, self.inv_perm = mesh.perm, mesh.inv_perm
         self.be = backend
         xp = self.xp = backend.xp
         self.dtype = np.dtype(dtype)
@@ -109,20 +110,26 @@ class FVMesh:
         d = xN - xc[P]
         db = xfb - xc[Pb]
         dd = np.einsum("fd,fd->f", d, d)
+        ddb = np.einsum("fd,fd->f", db, db)
+        if np.any(~np.isfinite(dd) | (dd <= 0)) or np.any(~np.isfinite(ddb) | (ddb <= 0)):
+            raise ValueError("mesh has coincident cell centres or a boundary face at its owner centre")
         w = np.clip(np.einsum("fd,fd->f", xN - xf, d) / dd, 0.0, 1.0)  # owner weight
         Sd = np.einsum("fd,fd->f", S, d)
         Sdb = np.einsum("fd,fd->f", Sb, db)
         SS = np.einsum("fd,fd->f", S, S)
         SSb = np.einsum("fd,fd->f", Sb, Sb)
-        alpha = SS / Sd
-        alpha_b = SSb / Sdb
+        if np.any(~np.isfinite(SS) | (SS <= 0)) or np.any(~np.isfinite(SSb) | (SSb <= 0)):
+            raise ValueError("mesh has non-finite or zero-area faces")
+        cosine_floor = np.cos(np.deg2rad(85.0))
+        alpha = SS / np.maximum(Sd, cosine_floor * np.sqrt(SS * dd))
+        alpha_b = SSb / np.maximum(Sdb, cosine_floor * np.sqrt(SSb * ddb))
         Tvec = S - alpha[:, None] * d
         self.non_orthogonality_deg = float(np.degrees(np.arccos(np.clip(
             Sd / np.sqrt(SS * dd), -1, 1))).max()) if P.size else 0.0
 
         # least-squares gradient matrices
         wl = 1.0 / dd
-        wlb = 1.0 / np.einsum("fd,fd->f", db, db)
+        wlb = 1.0 / ddb
         # assembled one symmetric component at a time: no (faces, dim, dim) temporaries
         Gm = np.zeros((nc, dim, dim))
         for a in range(dim):
@@ -173,6 +180,7 @@ class FVMesh:
         self.w = dev(w)
         self.alpha, self.alpha_b = dev(alpha), dev(alpha_b)
         self.Tvec = dev(Tvec)
+        self.alpha_h, self.alpha_b_h = alpha, alpha_b
         self.Sb_mag = dev(np.sqrt(SSb))
         nb_h = Sb / np.sqrt(SSb)[:, None]
         self.nb = dev(nb_h)
@@ -228,6 +236,47 @@ class FVMesh:
 
             if native_cuda.available():
                 self.cu = native_cuda.FVKernels(self, self.dxm)
+
+    def venkat_limiter(self, phi, phib, grad, k):
+        """Cellwise Venkatakrishnan factor on the actual, skewed face offsets."""
+        xp = self.xp
+        lo, hi = phi.copy(), phi.copy()
+        for cells, values in ((self.P, phi[self.N]), (self.N, phi[self.P]), (self.Pb, phib)):
+            xp.minimum.at(lo, cells, values)
+            xp.maximum.at(hi, cells, values)
+        limit = xp.ones_like(phi)
+        epsilon2 = (k * self.vol ** (1.0 / self.dim))**3
+        for cells, offsets in ((self.P, self.dP_f), (self.N, self.dN_f), (self.Pb, self.db)):
+            delta = xp.sum(grad[cells] * offsets, axis=1)
+            allowed = xp.where(delta >= 0, hi[cells], lo[cells]) - phi[cells]
+            eps2 = epsilon2[cells]
+            denominator = allowed**2 + 2.0 * delta**2 + allowed * delta + eps2
+            numerator = allowed**2 + eps2 + 2.0 * delta * allowed
+            positive = denominator > 0
+            factor = numerator / xp.where(positive, denominator, 1.0)
+            xp.minimum.at(limit, cells, xp.where(positive, xp.clip(factor, 0.0, 1.0), 1.0))
+        return limit
+
+    def pressure_geometry_matrix(self, open_faces):
+        """Host-only mesh operator for the initial device AMG hierarchy."""
+        P = self.mesh.owner[self.if_idx]
+        N = self.mesh.neighbour[self.if_idx].copy()
+        if self.n_periodic:
+            N[-self.n_periodic:] = np.concatenate([self.mesh.owner[p["faces_b"]] for p in self.mesh.periodic])
+        orth = self.alpha_h
+        diag = (np.bincount(P, orth, minlength=self.nc) + np.bincount(N, orth, minlength=self.nc)
+                + np.bincount(self.Pb_h, self.alpha_b_h * open_faces, minlength=self.nc))
+        rows = np.concatenate([np.arange(self.nc), P, N])
+        cols = np.concatenate([np.arange(self.nc), N, P])
+        return sp.csr_matrix((np.concatenate([diag, -orth, -orth]), (rows, cols)), shape=(self.nc, self.nc))
+
+    def to_original(self, values):
+        """Restore the input cell order of an exported host array."""
+        return values if self.inv_perm is None else values[self.inv_perm]
+
+    def to_internal(self, values):
+        """Map a host array from input cell order to solver order."""
+        return values if self.perm is None else values[self.perm]
 
     def _init_native(self, native, dxm):
         self.nat, self._lib = native, native.load()

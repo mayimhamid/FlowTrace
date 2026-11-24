@@ -413,6 +413,9 @@ class Job:
         ev = {"type": "frame", "mesh": "unstructured", "field": field, "fields": names,
               "data": _b64(vals), "min": lo, "max": hi,
               "step": solver.iteration, "t": solver.iteration, "cells": solver.nc}
+        physical_time = getattr(solver, "t", None)
+        if physical_time is not None and getattr(getattr(solver, "case", None), "unsteady", False):
+            ev["physical_time"] = physical_time
         if "x-velocity" in f and "y-velocity" in f and "z-velocity" not in f:
             ev["u"], ev["v"] = _b64(f["x-velocity"]), _b64(f["y-velocity"])  # streamlines and vectors
         return ev

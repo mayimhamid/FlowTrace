@@ -27,7 +27,11 @@ class P1Model:
         s = self.s = solver
         xp, c = s.xp, s.case
         self.xp = xp
-        self.gamma = 1.0 / (3.0 * (c.absorption + c.scattering))
+        coefficients = np.asarray([c.absorption, c.scattering])
+        extinction = float(coefficients.sum())
+        if not np.isfinite(extinction) or np.any(coefficients < 0) or extinction == 0:
+            raise ValueError("P1 requires finite non-negative coefficients and positive extinction")
+        self.gamma = 1.0 / (3.0 * extinction)
         eps = np.ones(s.fv.n_bf)
         rad = np.zeros(s.fv.n_bf, dtype=bool)
         for z in s.mesh.boundary_zones():
@@ -65,17 +69,14 @@ class P1Model:
                + fv.Cdiff_d @ (self.gamma * xp.sum(gf * fv.Tvec, axis=1)))
         A = fv.matrix(diag, -D, -D)
         r = s._residual(A, diag, self.G, rhs)
-        inv = 1.0 / diag
-        from ..linalg.krylov import bicgstab
-
-        self.G, _ = bicgstab(lambda v: A @ v, rhs, xp, M=lambda v: inv * v, x0=self.G, tol=1e-6, maxiter=200,
-                             relative_to_initial=True)
+        self.G, _ = s._solve(A, rhs, self.G, diag, tol=1e-6, maxiter=200)
         return r
 
     def energy_terms(self, T):
         """(extra diagonal, extra rhs) for the energy equation in temperature form (divided by cp)."""
         c, V = self.s.case, self.s.fv.vol
         a = c.absorption
+        T = self.xp.maximum(T, 0.0)
         T3 = T ** 3
         diag = 16.0 * a * SIGMA_SB * T3 * V / c.cp
         rhs = (a * self.G + 12.0 * a * SIGMA_SB * T3 * T) * V / c.cp
@@ -85,3 +86,39 @@ class P1Model:
         """Radiative heat flux into the domain on every boundary face (W)."""
         cb = self._wall_conductance()
         return cb * (4.0 * SIGMA_SB * Tb ** 4 - self.G[self.s.fv.Pb])
+
+
+class RadiationDeviceBuffers:
+    """Owned CUDA buffers for a caller's external radiation backend."""
+
+    def __init__(self, solver):
+        s = self.s = solver
+        fv, xp = s.fv, s.xp
+        nodes = s.mesh.nodes
+        indices, faces = [], []
+        for local_face, face in enumerate(fv.bf_idx):
+            ids = s.mesh.face_nodes[s.mesh.face_ptr[face]:s.mesh.face_ptr[face + 1]]
+            pts = nodes[ids]
+            turns = np.cross(pts - np.roll(pts, 1, axis=0), np.roll(pts, -1, axis=0) - pts)
+            normal = np.sum(turns, axis=0)
+            if np.any(turns @ normal < -1e-12 * (normal @ normal)):
+                raise ValueError("external radiation requires convex boundary polygons")
+            for k in range(1, len(ids) - 1):
+                indices.append((ids[0], ids[k], ids[k + 1]))
+                faces.append(local_face)
+        triangles = nodes[np.asarray(indices, dtype=np.int64).reshape(-1, 3)]
+        self.triangles = xp.asarray(triangles, dtype=s.dtype)
+        self.triangle_boundary_face = xp.asarray(faces, dtype=xp.int32)
+        self.absorption = xp.full(s.nc, s.case.absorption, dtype=s.dtype)
+        self.source = xp.zeros(s.nc, dtype=s.dtype)
+        self.temperature = s.T.copy()
+
+    def pointers(self):
+        s = self.s
+        arrays = {"cell_centroids": s.fv.xc, "temperatures": self.temperature,
+                  "absorption": self.absorption, "boundary_triangles": self.triangles,
+                  "triangle_boundary_face": self.triangle_boundary_face, "radiative_source": self.source}
+        return {name: int(array.data.ptr) for name, array in arrays.items()} | {
+            "cell_count": s.nc, "triangle_count": len(self.triangles), "dtype": s.dtype.name,
+            "stream": int(s.xp.cuda.get_current_stream().ptr),
+        }

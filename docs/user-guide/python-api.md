@@ -39,6 +39,34 @@ while not solver.finished:
 print(solver.mass_balance(), solver.heat_flow())
 ```
 
+### Unstructured solver options
+
+- `cell_order="rcm"` uses Reverse Cuthill-McKee on the cell adjacency graph,
+  including periodic neighbours. The mesh and public fields passed to Fluent
+  exporters retain their input cell IDs. Solver buffers use the internal order.
+- `scheme="venkatakrishnan"` uses a cellwise limiter and an implicit first-order
+  upwind matrix with a deferred second-order correction. Set `venkat_k` to
+  adjust the smoothness threshold.
+- `rhie_chow="consistent"` includes the previous outer iteration's face-flux
+  correction with the relaxed momentum diagonal. It also retains the existing
+  transient history term.
+- `precision="mixed"` keeps the unstructured pressure-based state and residuals
+  in FP64. Krylov corrections run with FP32 sparse matrices and fall back to an
+  FP64 solve when refinement fails to reduce the true residual.
+- `gpu_krylov="device"` keeps Krylov recurrence scalars on-device and checks
+  convergence at batch boundaries. The automatic FP64 path uses the lower-overhead
+  native CUDA momentum solver when available. Both modes keep the field arrays
+  on the GPU and reuse a geometry-based AMG hierarchy for pressure.
+
+
+A 3D CuPy pressure-based solver with energy enabled, `radiation="off"` and
+`lanes="off"` can call `get_device_pointers()` before stepping to expose
+stable CUDA addresses for an external radiation backend. Write the radiative
+source in W/m3 in internal cell order and enqueue the work on the returned
+CUDA stream. The source feeds the energy equation each step. The pointer
+interface supplies solver-owned buffers for convex boundary polygons, temperatures
+and absorption. The caller is responsible for its ray tracer and stream ordering.
+
 ### Time-dependent momentum forcing
 
 Call `SimpleSolver.set_sources(momentum=force)` before stepping. The function
@@ -108,11 +136,15 @@ try anyway.
 
 | `BoundarySpec.kind` | Fluent zone types mapped to it | Data |
 |---|---|---|
-| `wall` | wall | `velocity` or `rotation={"omega", "origin", "axis"}`; `thermal` = adiabatic / temperature / flux with `value` |
+| `wall` | wall | `velocity` or `rotation={"omega", "origin", "axis"}`; `thermal` = adiabatic / temperature / flux / convection with `value` |
 | `inlet` | velocity-inlet, mass-flow-inlet | `velocity` vector or `normal_speed`; `value` = temperature; turbulence `turb_intensity`, `turb_viscosity_ratio` or `k`, `omega`, `epsilon` |
 | `outlet` | pressure-outlet, outflow, … | static `pressure`; backflow takes `value` and the turbulence values |
 | `pressure` | pressure-inlet, inlet-vent | static `pressure`, inflow allowed |
 | `symmetry` | symmetry, axis | — |
+
+A convection wall uses `thermal="convection"`, the ambient temperature in
+`value` and `heat_transfer_coefficient` in W/(m2 K). For a Fluent warm start,
+the generated setup notes record these values for the corresponding wall zone.
 
 ### Zones
 

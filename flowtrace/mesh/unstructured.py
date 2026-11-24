@@ -57,6 +57,32 @@ class UnstructuredMesh:
     # faces_b[i] is the image of faces_a[i] shifted by translation (x_b = x_a + T)
     periodic: List[dict] = field(default_factory=list)
 
+    # Internal-to-original and original-to-internal cell indices, respectively.
+    perm: Optional[np.ndarray] = None
+    inv_perm: Optional[np.ndarray] = None
+
+    def reordered_rcm(self) -> UnstructuredMesh:
+        """RCM cell order, including adjacency through translational periodic faces."""
+        from dataclasses import replace
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import reverse_cuthill_mckee
+
+        if self.perm is not None:
+            return self
+        interior = self.neighbour >= 0
+        owners = np.concatenate([self.owner[interior], *[self.owner[p["faces_a"]] for p in self.periodic]])
+        neighbours = np.concatenate([self.neighbour[interior], *[self.owner[p["faces_b"]] for p in self.periodic]])
+        rows = np.concatenate([owners, neighbours])
+        cols = np.concatenate([neighbours, owners])
+        graph = csr_matrix((np.ones(rows.size, dtype=bool), (rows, cols)), shape=(self.n_cells, self.n_cells))
+        perm = reverse_cuthill_mckee(graph, symmetric_mode=True)
+        inv_perm = np.empty_like(perm)
+        inv_perm[perm] = np.arange(self.n_cells)
+        neighbour = self.neighbour.copy()
+        neighbour[interior] = inv_perm[neighbour[interior]]
+        return replace(self, owner=inv_perm[self.owner], neighbour=neighbour,
+                       cell_zone=self.cell_zone[perm], perm=perm, inv_perm=inv_perm)
+
     @property
     def n_faces(self) -> int:
         return self.owner.shape[0]
@@ -254,8 +280,9 @@ def compute_geometry(mesh: UnstructuredMesh, repair: bool = True) -> Geometry:
         for d in range(dim):
             mom[:, d] += np.bincount(cells, vc[d], minlength=nc)
         del v, vc
-    if np.any(vol <= 0):
-        raise ValueError(f"{int((vol <= 0).sum())} cells have non-positive volume")
+    bad_volume = ~np.isfinite(vol) | (vol <= 0)
+    if np.any(bad_volume):
+        raise ValueError(f"{int(bad_volume.sum())} cells have invalid or non-positive volume")
     cc = mom / vol[:, None]
     return Geometry(face_centre=fc, face_area_vec=S, face_area=np.linalg.norm(S, axis=1),
                     cell_centre=cc, cell_volume=vol, flipped_faces=flipped)

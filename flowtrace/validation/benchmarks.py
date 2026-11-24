@@ -475,18 +475,19 @@ def b_mass(ctx):
                           types=("velocity-inlet", "pressure-outlet", "wall", "wall"))
     bnd = default_boundaries(m)
     bnd["inlet"] = BoundarySpec("inlet", normal_speed=1.0)
-    s1 = _run_simple(SimpleSolver(m, UnstructuredCase(boundaries=bnd, viscosity=0.02, max_iter=1500, tol=1e-7), backend=be))
+    channel = UnstructuredCase(boundaries=bnd, viscosity=0.02, max_iter=3000, tol=1e-12, pressure_tol=1e-3)
+    s1 = _run_simple(SimpleSolver(m, channel, backend=be))
     c = backward_facing_step(re=100, n_per_h=6)
     probe = MACSolver(c, backend=_be({"backend": "numpy"}))
     mesh = structured_mesh(c, probe.solid_h)
     s2 = _run_simple(SimpleSolver(mesh, UnstructuredCase(boundaries=structured_boundary_specs(c), viscosity=c.nu,
-                                                         max_iter=3000, tol=1e-6), backend=be))
+                                                         max_iter=6000, tol=1e-12, pressure_tol=1e-3), backend=be))
     r = BenchResult("simplec_mass_balance", "", "verification")
     for name, s in (("channel", s1), ("step mesh", s2)):
         mb = s.mass_balance()
         inflow = sum(-v for v in mb.values() if v < 0)
         imb = abs(sum(mb.values())) / inflow
-        r.metrics[f"net mass imbalance / inflow, {name}"] = _m(imb, 0.0, "", "< 1e-8", imb < 1e-8)
+        r.metrics[f"net mass imbalance / inflow, {name}"] = _m(imb, 0.0, "", "< 1e-12", imb < 1e-12)
     return r
 
 

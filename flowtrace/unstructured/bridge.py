@@ -320,8 +320,8 @@ class Bridge:
 class LaneTuner:
     """Measure the run's own iterations under each candidate configuration; keep the fastest.
 
-    Phase 1, placement: the serial solver, then every candidate lane assignment (all lanes on the
-    solver's device, all on the other device, mixed), ``WINDOW`` iterations each.
+    Phase 1 compares serial execution with lanes on the solver's chosen device.
+    Each candidate runs for ``WINDOW`` measured iterations.
     Phase 2, core budget: the winner is re-timed with half the CPU threads, then a quarter, ... while
     that is at least ``BUDGET_GAIN`` faster. Small meshes are often fastest on few cores: an OpenMP
     region costs more than the work it splits, and concurrent lanes then also stop competing.
@@ -360,21 +360,7 @@ class LaneTuner:
     def _placements(self) -> List[Tuple[str, Optional[Dict[str, str]], int]]:
         s = self.s
         home = s.be.device
-        other = None
-        if not s.case.unsteady:  # a shadow solver does not carry the time history
-            if home == "cpu" and s.dtype == np.float64 and gpu_available():
-                other = "gpu"
-            elif home == "gpu":
-                other = "cpu"
-        L, H = self.lanes, home.upper()
-        out = [(f"lanes on the {H}", {n: home for n in L}, self.cores)]
-        if other:
-            O = other.upper()
-            out.append((f"lanes on the {O}", {n: other for n in L}, self.cores))
-            if len(L) == 2:
-                out.append((f"energy on the {O}, species on the {H}", {"energy": other, "species": home}, self.cores))
-                out.append((f"energy on the {H}, species on the {O}", {"energy": home, "species": other}, self.cores))
-        return out
+        return [(f"lanes on the {home.upper()}", {name: home for name in self.lanes}, self.cores)]
 
     def _threads(self, assignment: Optional[Dict[str, str]], budget: int) -> Dict[str, int]:
         """Split ``budget`` CPU threads between the flow (if on the CPU) and the CPU lanes, in

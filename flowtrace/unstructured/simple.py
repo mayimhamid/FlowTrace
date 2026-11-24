@@ -30,7 +30,7 @@ import numpy as np
 
 from ..hardware.backend import get_backend
 from ..linalg.amg import make_amg
-from ..linalg.krylov import bicgstab, pcg
+from ..linalg.krylov import bicgstab, device_krylov, pcg, refined_krylov
 from ..mesh.unstructured import UnstructuredMesh
 from .case import FLUENT_TO_KIND, BoundarySpec, UnstructuredCase
 from .fvmesh import FVMesh
@@ -138,7 +138,16 @@ class NonOrthogonalPressureCorrector:
 
 
 _KIND_CODE = {"wall": WALL, "inlet": INLET, "outlet": OUTLET, "pressure": PRESSURE, "symmetry": SYMMETRY}
-T_ADIABATIC, T_FIXED, T_FLUX = range(3)
+T_ADIABATIC, T_FIXED, T_FLUX, T_CONVECTION = range(4)
+_THERMAL_WALL = {"adiabatic": T_ADIABATIC, "temperature": T_FIXED, "flux": T_FLUX, "convection": T_CONVECTION}
+
+
+def wall_film(xp, gamma_b, alpha_b, film):
+    """Face-temperature fraction and conductance for two series resistances."""
+    conduction = gamma_b * alpha_b
+    total = conduction + film
+    fraction = film / xp.where(total > 0.0, total, 1.0)
+    return fraction, conduction * fraction
 
 
 class SimpleSolver:
@@ -156,10 +165,11 @@ class SimpleSolver:
             for za, zb in case.periodic:
                 mesh = make_periodic(mesh, za, zb)
             self.mesh = mesh
-        self.fv = fv = FVMesh(mesh, self.be, self.dtype)
+        self.fv = fv = FVMesh(mesh, self.be, self.dtype, cell_order=case.cell_order)
         self.dim = dim = mesh.dim
         self.nc = mesh.n_cells
         self.energy = case.energy
+        self._radiation_buffers = None
         self.timers: Dict[str, float] = defaultdict(float)
         self.iteration = 0
         self.step_count = 0
@@ -178,6 +188,13 @@ class SimpleSolver:
         self.external_energy = False  # True when a conjugate (fluid+solid) solver owns the energy equation
         self.relax_p = float(case.relax_p) if case.relax_p is not None else auto_relax_p(fv.non_orthogonality_deg)
         self._build_boundaries()
+        self._resident_gpu = self.be.is_gpu and not getattr(xp, "__fake__", False)
+        self._device_krylov = self._resident_gpu and (
+            case.gpu_krylov == "device" or case.precision == "mixed" or fv.cu is None
+        )
+        if self._resident_gpu:
+            open_faces = (self.bkind_h == OUTLET) | (self.bkind_h == PRESSURE)
+            self._amg = make_amg(fv.pressure_geometry_matrix(open_faces), self.be, singular=self.singular_p)
         U0 = np.zeros((self.nc, dim))
         iv = list(case.init_velocity) + [0.0] * 3
         U0[:] = iv[:dim]
@@ -206,7 +223,7 @@ class SimpleSolver:
         self.time_step = 0
         self.inner = 0
         self._old: Dict[str, tuple] = {}
-        self._F_old: list = []
+        self._face_flux_history: list = []
         if case.unsteady:
             self._store_old()
         # a user-set relaxation is left alone; transient runs restart every time step from a larger
@@ -225,15 +242,15 @@ class SimpleSolver:
         U = self.be.to_numpy(self.U).astype(np.float64)
         for k, name in enumerate(("x-velocity", "y-velocity", "z-velocity")[:dim]):
             if name in fields:
-                U[:, k] = np.asarray(fields[name], dtype=np.float64)
+                U[:, k] = self.fv.to_internal(np.asarray(fields[name], dtype=np.float64))
         self.U = xp.asarray(U, dtype=self.dtype)
         if "pressure" in fields:
-            p = np.asarray(fields["pressure"], dtype=np.float64)
+            p = self.fv.to_internal(np.asarray(fields["pressure"], dtype=np.float64))
             if self.singular_p:
                 p = p - p.mean()
             self.p = xp.asarray(p, dtype=self.dtype)
         if self.energy and "temperature" in fields:
-            self.T = xp.asarray(np.asarray(fields["temperature"], dtype=np.float64), dtype=self.dtype)
+            self.T = xp.asarray(self.fv.to_internal(np.asarray(fields["temperature"], dtype=np.float64)), dtype=self.dtype)
         ub = self._velocity_bvals(self.U)
         self.F = self.case.density * xp.sum(self.fv.face_interp_vec(self.U) * self.fv.S, axis=1)
         self.Fb = self._boundary_flux_fixed(ub)
@@ -256,15 +273,32 @@ class SimpleSolver:
         mom_source = energy_source = None
         if momentum is not None and not callable(momentum):
             m = np.asarray(momentum, dtype=np.float64).reshape(self.nc, self.dim)
-            mom_source = xp.asarray(m * self.be.to_numpy(self.fv.vol)[:, None], dtype=self.dtype)
+            mom_source = xp.asarray(self.fv.to_internal(m) * self.be.to_numpy(self.fv.vol)[:, None], dtype=self.dtype)
         if energy is not None:
             if not self.energy:
                 raise ValueError("energy source given but the energy equation is off")
             e = np.asarray(energy, dtype=np.float64).reshape(self.nc)
-            energy_source = xp.asarray(e * self.be.to_numpy(self.fv.vol) / self.case.cp, dtype=self.dtype)
+            energy_source = xp.asarray(self.fv.to_internal(e) * self.be.to_numpy(self.fv.vol) / self.case.cp, dtype=self.dtype)
         self.mom_source, self.energy_source = mom_source, energy_source
         self._momentum_forcing = momentum if callable(momentum) else None
         self._forcing_step = None
+
+    def get_device_pointers(self) -> dict:
+        """Expose stable CUDA addresses for external radiation integration.
+
+        The caller writes heat per unit volume to radiative_source in solver
+        cell order. It must enqueue its work on the returned stream or ensure
+        ordering before the solver steps. Buffers belong to the solver.
+        """
+        if not self._resident_gpu or self.dim != 3 or not self.energy:
+            raise ValueError("external radiation pointers require a 3D CuPy solver with energy enabled")
+        if self.rad is not None or self.external_energy or self._bridge is not None or self._tuner is not None:
+            raise ValueError("external radiation pointers require radiation='off', local energy and lanes='off'")
+        if self._radiation_buffers is None:
+            from .radiation import RadiationDeviceBuffers
+
+            self._radiation_buffers = RadiationDeviceBuffers(self)
+        return self._radiation_buffers.pointers()
 
     def _sample_momentum_forcing(self) -> None:
         if self._momentum_forcing is None or self._forcing_step == self.time_step:
@@ -276,7 +310,7 @@ class SimpleSolver:
         if force.shape != (self.nc, self.dim) or not np.isfinite(force).all():
             raise ValueError(f"momentum forcing must return a finite array of shape {(self.nc, self.dim)}")
         xp, vol = self.xp, self.fv.vol
-        integrated = xp.asarray(force, dtype=self.dtype) * vol[:, None]
+        integrated = xp.asarray(self.fv.to_internal(force), dtype=self.dtype) * vol[:, None]
         if self.singular_p and not (self.bkind_h == INLET).any():
             mean = xp.sum(integrated, axis=0) / xp.sum(vol)
             integrated = integrated - vol[:, None] * mean
@@ -296,6 +330,7 @@ class SimpleSolver:
         xfb = self.be.to_numpy(fv.xfb).astype(np.float64)
         Pb_h = self.be.to_numpy(fv.Pb)
         self._build_mrf()
+        film = np.zeros(n)
         self.zone_specs = {}
         for z in self.mesh.boundary_zones():
             spec = case.boundaries.get(z.name)
@@ -323,7 +358,9 @@ class SimpleSolver:
                     ub[m] = self._frame_at(xfb[m], Pb_h[m])
             pb[m] = spec.pressure
             if spec.kind == "wall":
-                tk[m] = {"adiabatic": T_ADIABATIC, "temperature": T_FIXED, "flux": T_FLUX}[spec.thermal]
+                tk[m] = _THERMAL_WALL[spec.thermal]
+                if spec.thermal == "convection":
+                    film[m] = spec.heat_transfer_coefficient
             elif spec.kind in ("inlet", "pressure"):
                 tk[m] = T_FIXED
             tv[m] = spec.value
@@ -334,6 +371,8 @@ class SimpleSolver:
         self.pb_fixed = d(pb)
         self.tkind = xp.asarray(tk)
         self.tval = d(tv)
+        self.has_film = bool(np.any(film))
+        self.film = d(film) * fv.Sb_mag / case.cp if self.has_film else None
         self.m_wall = d(kind == WALL)
         self.m_inlet = d(kind == INLET)
         self.m_pres = d((kind == OUTLET) | (kind == PRESSURE))
@@ -360,7 +399,7 @@ class SimpleSolver:
             z = self.mesh.zone_by_name(zname)
             if z is None or z.kind != "cell":
                 raise ValueError(f"MRF zone {zname!r} is not a cell zone of this mesh")
-            self._frame_zone[self.mesh.cell_zone == z.id] = i
+            self._frame_zone[self.fv.mesh.cell_zone == z.id] = i
             self.mrf_zones[zname] = rot
             rots.append(rot)
         self._rots = rots
@@ -482,17 +521,26 @@ class SimpleSolver:
         fv, xp = self.fv, self.xp
         F, Fb = conv if conv is not None else self._conv()
         gface, _ = self._split_gamma(gamma)
+        scheme = scheme or self.case.scheme
+        if fv.cu is not None:
+            order = {"second-order": 1, "venkatakrishnan": 2}.get(scheme, 0)
+            limiter = fv.venkat_limiter(phi, phi_b, grad, self.case.venkat_k) if order == 2 else None
+            return fv.cu.transport_rhs(gface, phi, grad, phi_b, Db, F, Fb, extra, order, limiter)
         rhs = fv.Cb_d @ ((Db + xp.maximum(-Fb, 0.0)) * phi_b)
         # non-orthogonal diffusion flux into P: gamma (grad phi)_f . T_f, outward from P
         gf = fv.face_interp_vec(grad)
         rhs = rhs + fv.Cdiff_d @ (gface * xp.sum(gf * fv.Tvec, axis=1))
-        if (scheme or self.case.scheme) == "second-order":
+        if scheme in ("second-order", "venkatakrishnan"):
             P, N = fv.P, fv.N
             phP, phN = phi[P], phi[N]
             hoP = phP + xp.sum(grad[P] * fv.dP_f, axis=1)
             hoN = phN + xp.sum(grad[N] * fv.dN_f, axis=1)
             up = F >= 0
-            ho = xp.clip(xp.where(up, hoP, hoN), xp.minimum(phP, phN), xp.maximum(phP, phN))
+            if scheme == "venkatakrishnan":
+                limiter = fv.venkat_limiter(phi, phi_b, grad, self.case.venkat_k)
+                ho = xp.where(up, phP + limiter[P] * (hoP - phP), phN + limiter[N] * (hoN - phN))
+            else:
+                ho = xp.clip(xp.where(up, hoP, hoN), xp.minimum(phP, phN), xp.maximum(phP, phN))
             rhs = rhs - fv.Cdiff_d @ (F * (ho - xp.where(up, phP, phN)))
         if extra is not None:
             rhs = rhs + extra
@@ -547,8 +595,11 @@ class SimpleSolver:
         for name, v in cur.items():
             prev = self._old.get(name, (v, v))[0]
             self._old[name] = (v, prev)
-        Fprev = self._F_old[0] if self._F_old else self.F.copy()
-        self._F_old = [self.F.copy(), Fprev]
+        # Choi's historical face velocities are fixed across the inner iterations.
+        volume_flux = self.xp.sum(self.fv.face_interp_vec(self.U) * self.fv.S, axis=1)
+        fluxes = (self.F.copy(), volume_flux)
+        previous = self._face_flux_history[0] if self._face_flux_history else fluxes
+        self._face_flux_history = [fluxes, previous]
 
     def _advance_time(self):
         self._sync_lanes()
@@ -573,6 +624,8 @@ class SimpleSolver:
     def T(self, value):
         self._sync_lanes()
         self._T = value
+        if self._radiation_buffers is not None and value is not None:
+            self.xp.copyto(self._radiation_buffers.temperature, value)
         b = self.__dict__.get("_bridge")
         if b is not None:
             b.mark_dirty("energy")
@@ -713,17 +766,35 @@ class SimpleSolver:
     def _wall_temperature(self, T=None):
         """Boundary-face temperatures: fixed values, else the adjacent cell (adiabatic/flux/outflow)."""
         TP = (self.T if T is None else T)[self.fv.Pb]
-        return self.xp.where(self.tkind == T_FIXED, self.tval, TP)
+        xp = self.xp
+        Tb = xp.where(self.tkind == T_FIXED, self.tval, TP)
+        if self.has_film:
+            fraction, _ = wall_film(xp, self.case.conductivity / self.case.cp, self.fv.alpha_b, self.film)
+            Tb = Tb + fraction * (self.tval - TP)
+        return Tb
 
     def _solve(self, A, b, x0, diag, tol=0.1, maxiter=30):
         inv = 1.0 / diag
-        if self.fv.nat is not None:  # the whole Krylov loop in C++ (same algorithm and stopping rules)
+        M = lambda v: inv.astype(v.dtype, copy=False) * v
+        device = getattr(self, "_device_krylov", False)
+        if self.case.precision == "mixed":
+            return refined_krylov(A, b, self.xp, M, x0, tol, maxiter, relative_to_initial=True, device=device)
+        if self.fv.nat is not None:
             return self.fv.nat.bicgstab_jacobi(A, b, x0, inv, tol, maxiter, relative_to_initial=True, lib=self.fv._lib)
+        if device:
+            return device_krylov(lambda v: A @ v, b, self.xp, M, x0, tol, maxiter, relative_to_initial=True)
         if self.fv.cu is not None:
             return self.fv.cu.bicgstab_jacobi(A, b, x0, inv, tol, maxiter)
-        x, info = bicgstab(lambda v: A @ v, b, self.xp, M=lambda v: inv * v, x0=x0, tol=tol, maxiter=maxiter,
-                           relative_to_initial=True)
-        return x, info
+        return bicgstab(lambda v: A @ v, b, self.xp, M=M, x0=x0, tol=tol, maxiter=maxiter, relative_to_initial=True)
+
+    def _solve_pressure(self, A, b, project, x0=None):
+        tol = self.case.pressure_tol
+        if self.case.precision == "mixed":
+            return refined_krylov(A, b, self.xp, self._amg, x0, tol, 200, symmetric=True, project=project,
+                                  device=self._device_krylov)
+        if self._device_krylov:
+            return device_krylov(lambda v: A @ v, b, self.xp, self._amg, x0, tol, 200, symmetric=True, project=project)
+        return pcg(lambda v: A @ v, b, self.xp, M=self._amg, x0=x0, tol=tol, maxiter=200, project=project)
 
     # ------------------------------------------------------------------
     def step(self) -> float:
@@ -845,6 +916,9 @@ class SimpleSolver:
             denom = diag_r
         dP = fv.vol / denom
         dF = fv.face_interp(dP)
+        consistent_rc = c.rhie_chow == "consistent"
+        rc_cell = fv.vol / diag_r if consistent_rc else dP
+        rc_face = fv.face_interp(rc_cell) if consistent_rc else dF
         gpf = fv.face_interp_vec(gp)
         P, N = fv.P, fv.N
         # Rhie-Chow: compact minus interpolated pressure gradient, both projected on
@@ -852,20 +926,24 @@ class SimpleSolver:
         # interpolated gradient on S instead leaves a spurious grad(p).T mass flux
         # on non-orthogonal faces, which MMS shows as a non-converging pressure.)
         Fst = rho * (xp.sum(fv.face_interp_vec(Ustar) * fv.S, axis=1)
-                     - dF * fv.alpha * (p[N] - p[P] - xp.sum(gpf * fv.d, axis=1)))
+                     - rc_face * fv.alpha * (p[N] - p[P] - xp.sum(gpf * fv.d, axis=1)))
+        if consistent_rc:
+            Fst += (1 - au) * (self.F - rho * xp.sum(fv.face_interp_vec(U) * fv.S, axis=1))
         if tcoef is not None:
             # Choi's correction: keeps the converged face flux independent of the time step
-            r = rho * dF / c.dt
-            Un = xp.stack([self._old[f"U{k}"][0] for k in range(dim)], axis=1)
-            corr = tcoef[1] * (self._F_old[0] - rho * xp.sum(fv.face_interp_vec(Un) * fv.S, axis=1))
+            r = rho * rc_face / c.dt
+            mass_n, volume_n = self._face_flux_history[0]
+            corr = tcoef[1] * (mass_n - rho * volume_n)
             if tcoef[2]:
-                Unm = xp.stack([self._old[f"U{k}"][1] for k in range(dim)], axis=1)
-                corr = corr + tcoef[2] * (self._F_old[1] - rho * xp.sum(fv.face_interp_vec(Unm) * fv.S, axis=1))
+                mass_nm, volume_nm = self._face_flux_history[1]
+                corr = corr + tcoef[2] * (mass_nm - rho * volume_nm)
             Fst = Fst + r * corr
         Pb = fv.Pb
         Fb_in = rho * xp.sum(self.ub_fixed * fv.Sb, axis=1) * self.m_inlet
         Fb_pr = rho * (xp.sum(Ustar[Pb] * fv.Sb, axis=1)
-                       - dP[Pb] * fv.alpha_b * (p_open - p[Pb] - xp.sum(gp[Pb] * fv.db, axis=1)))
+                       - rc_cell[Pb] * fv.alpha_b * (p_open - p[Pb] - xp.sum(gp[Pb] * fv.db, axis=1)))
+        if consistent_rc:
+            Fb_pr += (1 - au) * (self.Fb - rho * xp.sum(U[Pb] * fv.Sb, axis=1))
         Fbst = Fb_in + Fb_pr * self.m_pres
 
         # ---------------- pressure correction ----------------
@@ -877,7 +955,7 @@ class SimpleSolver:
         res["continuity"] = float(xp.sum(xp.abs(mass)))
         t3 = time.perf_counter()
         tm["assembly"] += t3 - t2
-        if self._amg is None or self._amg_age >= self.amg_rebuild:
+        if not self._resident_gpu and (self._amg is None or self._amg_age >= self.amg_rebuild):
             Ah = Ap.get() if self.be.is_gpu else Ap
             self._amg = make_amg(Ah, self.be, singular=self.singular_p)
             self._amg_age = 0
@@ -888,7 +966,7 @@ class SimpleSolver:
         else:
             project = None
         pressure_rhs = -mass
-        pp, pinfo = pcg(lambda v: Ap @ v, pressure_rhs, xp, M=self._amg, tol=c.pressure_tol, maxiter=200, project=project)
+        pp, pinfo = self._solve_pressure(Ap, pressure_rhs, project)
 
         # Deferred non-orthogonal corrector sweeps (reusing frozen Ap and AMG preconditioner)
         n_no = c.n_non_ortho if c.n_non_ortho is not None else (2 if fv.non_orthogonality_deg > 5.0 else 0)
@@ -903,8 +981,7 @@ class SimpleSolver:
                 Tvec_b = fv.Sb - fv.alpha_b[:, None] * fv.db
                 Fb_no = rho * dP[Pb] * xp.sum(gpp[Pb] * Tvec_b, axis=1) * self.m_pres
                 pressure_rhs = -mass + fv.net_outflow(F_no, Fb_no)
-                pp, pinfo = pcg(lambda v: Ap @ v, pressure_rhs, xp, M=self._amg, x0=pp,
-                                tol=c.pressure_tol, maxiter=200, project=project)
+                pp, pinfo = self._solve_pressure(Ap, pressure_rhs, project, x0=pp)
         # Reuse the lagged tangential fluxes from the final Poisson RHS.
         t4 = time.perf_counter()
         tm["pressure"] += t4 - t3
@@ -1005,7 +1082,7 @@ class SimpleSolver:
         """All residuals below ``tol``. With lanes in flight the scalar residuals in ``res`` are one
         iteration old: collect the lanes and test their fresh residuals too, so that convergence is
         only declared on a state that is converged in every field."""
-        if not max(res.values()) < tol:  # written so that a NaN residual is never "below"
+        if not all(value < tol for value in res.values()):
             return False
         b = self._bridge
         if b is None or not b.busy:
@@ -1013,7 +1090,7 @@ class SimpleSolver:
         b.await_all()
         res.update(b.residuals)
         self._last_res = res
-        return max(res.values()) < tol
+        return all(value < tol for value in res.values())
 
     # divergence guard: roll back and lower the pressure under-relaxation
     GUARD_GROWTH = 20.0  # continuity above GUARD_GROWTH x its running minimum = diverging
@@ -1030,7 +1107,7 @@ class SimpleSolver:
         self.relax_u = self.case.relax_u  # lowered by the guard on convection-dominated, skewed cases
         self.guard_exhausted_at = None  # iteration at which divergence was seen with relax_p at its floor
         self._guard_min = float("inf")
-        self._guard_snap = (self.state_dict(), float("inf")) if self.guard_enabled else None
+        self._guard_snap = (self._state_snapshot(device=True), float("inf")) if self.guard_enabled else None
 
     def _stability_guard(self, raw_continuity: float, flux_scale: float) -> bool:
         """Detect a diverging pressure-velocity coupling and recover from it.
@@ -1085,7 +1162,7 @@ class SimpleSolver:
         if math.isfinite(r) and self.iteration > 5:  # past the start-up transient
             self._guard_min = min(self._guard_min, r)
             if self.iteration % self.GUARD_EVERY == 0 and r <= 2.0 * self._guard_min:
-                self._guard_snap = (self.state_dict(), r)
+                self._guard_snap = (self._state_snapshot(device=True), r)
         return False
 
     def _energy_inputs(self) -> dict:
@@ -1100,7 +1177,7 @@ class SimpleSolver:
 
     def _energy(self) -> dict:
         T, res, cap = self._energy_kernel(self._T, self._energy_inputs())
-        self._T = T
+        self.T = T
         self._energy_capture = cap
         return res
 
@@ -1120,13 +1197,21 @@ class SimpleSolver:
             TP = TP + xp.sum(self._gT[fv.Pb] * fv.db_t, axis=1)
         Tb = xp.where(fixed, self.tval, TP)
         Tb = xp.where(out & (inp["Fb_abs"] < 0), self.tval, Tb)  # backflow enters at the outlet's T
+        if self.has_film:
+            fraction, conductance = wall_film(xp, self._split_gamma(gam)[1], fv.alpha_b, self.film)
+            Tb = Tb + fraction * (self.tval - TP)
         gT = fv.gradient(T, Tb)
         self._gT = gT
         q_in = fv.Cb_d @ (flux * self.tval * fv.Sb_mag / c.cp)
         if inp["src"] is not None:
             q_in = q_in + inp["src"]
+        if self._radiation_buffers is not None:
+            q_in = q_in + self._radiation_buffers.source * fv.vol / c.cp
         diag, aPN, aNP, Db = self._coefficients(gam, fixed.astype(self.dtype), conv)
         rhs = self._rhs(gam, T, gT, Tb, Db, q_in, scheme=c.scalar_convection, conv=conv)
+        if self.has_film:
+            diag = diag + fv.Cb_d @ conductance
+            rhs = rhs + fv.Cb_d @ (conductance * (self.tval - (TP - T[fv.Pb])))
         if self.rad is not None:
             dd, rr = self.rad.energy_terms(T)
             diag = diag + dd
@@ -1185,7 +1270,9 @@ class SimpleSolver:
             "turbulence": self.case.turbulence,
             "backend": self.be.name, "device": self.be.device, "precision": str(self.dtype),
             "cells": self.nc, "faces": self.mesh.n_faces, "dim": self.dim,
-            "convection": self.case.scheme,
+            "convection": self.case.scheme, "cell_order": self.case.cell_order,
+            "linear_precision": self.case.precision, "rhie_chow": self.case.rhie_chow,
+            "gpu_krylov": "device" if self._device_krylov else self.case.gpu_krylov,
             "relax_p": self.relax_p,
             "stability_rollbacks": list(self.guard_events),
             "stability_guard_exhausted_at": self.guard_exhausted_at,
@@ -1215,10 +1302,10 @@ class SimpleSolver:
             out[name] = h(Y).astype(np.float64)
         if names:
             out = {k: v for k, v in out.items() if k in names}
-        return out
+        return {k: self.fv.to_original(v) for k, v in out.items()}
 
     def cell_centres(self) -> np.ndarray:
-        return self.fv.geometry.cell_centre
+        return self.fv.to_original(self.fv.geometry.cell_centre)
 
     def mass_balance(self) -> dict:
         """Net mass flow through every boundary zone (should sum to ~0)."""
@@ -1363,6 +1450,12 @@ class SimpleSolver:
         Tb = np.where((kind == OUTLET) & (Fb < 0), tv, Tb)
         cond = c.conductivity * alpha_b * (Tb - TP) * (tk == T_FIXED)
         cond = cond + np.where(tk == T_FLUX, tv * Sb, 0.0)
+        if self.has_film:
+            _, conductance = wall_film(np, c.conductivity, alpha_b, c.cp * h(self.film))
+            Tp_film = TP
+            if self._gT is not None:
+                Tp_film = Tp_film + np.sum(h(self._gT)[Pb] * h(fv.db_t), axis=1)
+            cond = cond + conductance * (tv - Tp_film)
         conv = -c.cp * Fb * Tb  # Fb > 0 is outflow
         q = cond + conv
         out = {}
@@ -1371,19 +1464,24 @@ class SimpleSolver:
         return out
 
     def state_dict(self) -> dict:
+        return self._state_snapshot(device=False)
+
+    def _state_snapshot(self, *, device):
         self._sync_lanes()
-        h = self.be.to_numpy
+        h = (lambda field: field.copy()) if device else self.be.to_numpy
         st = {"U": h(self.U), "p": h(self.p), "F": h(self.F), "Fb": h(self.Fb), "iteration": self.iteration}
         if self.energy:
             st["T"] = h(self.T)
         if self.turb is not None:
-            st.update(self.turb.state())
+            st.update(k=h(self.turb.k), w=h(self.turb.w), mut=h(self.turb.mut))
             if self._gp is not None:
                 st["grad_p"] = h(self._gp)
             if self._gp_eff is not None:
                 st["grad_p_eff"] = h(self._gp_eff)
             if self._gU is not None:
                 st["grad_U"] = h(self.xp.stack(self._gU))
+        if self.fv.perm is not None:
+            st["cell_permutation"] = self.fv.perm
         st["time"], st["time_step"] = self.time, self.time_step
         st["res_continuity_norm"] = self._res_max5.get("continuity", 0.0)
         if self.rad is not None:
@@ -1396,6 +1494,18 @@ class SimpleSolver:
         self._sync_lanes()
         if self._bridge is not None:
             self._bridge.mark_dirty()  # cross-device lanes reload T, G and Y (and drop their lagged gradient)
+        previous_order = st.get("cell_permutation")
+        if not np.array_equal(previous_order, self.fv.perm):
+            previous_inverse = None if previous_order is None else np.argsort(previous_order)
+            order = np.arange(self.nc) if self.fv.perm is None else self.fv.perm
+            if previous_inverse is not None:
+                order = previous_inverse[order]
+            st = dict(st)
+            for key in ("U", "p", "T", "k", "w", "mut", "G", "grad_p", "grad_p_eff", *(f"Y:{n}" for n in self.Y)):
+                if key in st:
+                    st[key] = st[key][order]
+            if "grad_U" in st:
+                st["grad_U"] = st["grad_U"][:, order]
         xp = self.xp
         self.U = xp.asarray(st["U"], dtype=self.dtype)
         self.p = xp.asarray(st["p"], dtype=self.dtype)
@@ -1422,5 +1532,5 @@ class SimpleSolver:
         self.time = float(st.get("time", 0.0))
         self.time_step = int(st.get("time_step", 0))
         if self.case.unsteady:
-            self._old, self._F_old = {}, []
+            self._old, self._face_flux_history = {}, []
             self._store_old()

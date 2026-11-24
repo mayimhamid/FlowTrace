@@ -64,24 +64,24 @@ MODELS = ("laminar", "k-omega-sst", "k-epsilon-realizable", "k-epsilon-standard"
 
 
 def spalding_uplus(re_y: np.ndarray, iters: int = 30, *,
-                   kappa: float = KAPPA, B: float = B_SPALDING, tol: float = 1e-10) -> np.ndarray:
+                   kappa: float = KAPPA, B: float = B_SPALDING, tol: float = 1e-10, xp=np) -> np.ndarray:
     """Solve u+ y+(u+) = Re_y for the Spalding wall law."""
-    re_y = np.maximum(np.asarray(re_y, dtype=float), 0.0)
+    re_y = xp.maximum(xp.asarray(re_y, dtype=float), 0.0)
     eb = math.exp(-kappa * B)
-    up = np.minimum(np.sqrt(re_y), np.log1p(re_y) / kappa + B)
-    up = np.where(re_y > 0, up, 1.0)
+    up = xp.minimum(xp.sqrt(re_y), xp.log1p(re_y) / kappa + B)
+    up = xp.where(re_y > 0, up, 1.0)
     for _ in range(iters):
         ku = kappa * up
-        exp_neg = np.exp(-ku)
-        tail = -np.expm1(-ku) - exp_neg * (ku + ku**2 / 2)
+        exp_neg = xp.exp(-ku)
+        tail = -xp.expm1(-ku) - exp_neg * (ku + ku**2 / 2)
         yp_scaled = up * exp_neg + eb * (tail - exp_neg * ku**3 / 6)
         dyp_scaled = exp_neg + kappa * eb * tail
         # Scale g and its analytic derivative by exp(-kappa u+)/u+.
         step = (yp_scaled - (re_y * exp_neg) / up) / (yp_scaled / up + dyp_scaled)
-        up = np.where(re_y > 0, np.maximum(up - step, 0.5 * up), up)
-        if np.all((re_y == 0) | (np.abs(step) <= tol * up)):
+        up = xp.where(re_y > 0, xp.maximum(up - step, 0.5 * up), up)
+        if xp is np and xp.all((re_y == 0) | (xp.abs(step) <= tol * up)):
             break
-    return np.where(re_y > 0, up, 0.0)
+    return xp.where(re_y > 0, up, 0.0)
 
 
 def spaldings_law_wall_shear(
@@ -256,6 +256,13 @@ class TurbulenceModel:
         if self.wall_cells.size:
             self.y[self.wall_cells] = ywc[self.wall_cells]
         self.y_d = xp.asarray(self.y, dtype=s.dtype)
+        self.yb_d = xp.asarray(self.yb, dtype=s.dtype)
+        self.wall_b_d = xp.asarray(self.wall_b)
+        self.wall_cells_d = xp.asarray(self.wall_cells)
+        self.wall_distance_d = xp.asarray(ywc[self.wall_cells], dtype=s.dtype)
+        self.inlet_b_d, self.open_b_d = xp.asarray(self.inlet_b), xp.asarray(self.open_b)
+        self.wall_area_d = xp.where(self.wall_b_d, fv.Sb_mag, 0.0)
+        self.wall_area_cell_d = fv.Cb_d @ self.wall_area_d
         # inlet / backflow values
         spd = np.linalg.norm(h(s.ub_fixed).astype(np.float64), axis=1)
         u_ref = float(spd[self.inlet_b].max()) if self.inlet_b.any() else float(c.turb_reference_velocity or 1.0)
@@ -271,8 +278,8 @@ class TurbulenceModel:
             k = 1.5 * (I * U) ** 2 if spec.k is None else np.full(m.sum(), spec.k)
             kin[m] = np.maximum(k, 1e-12 * self.u_ref ** 2)
             sin[m] = self.second_from(kin[m], r, getattr(spec, self.second))
-        self.kb_in = kin
-        self.sb_in = sin
+        self.kb_in = xp.asarray(kin, dtype=s.dtype)
+        self.sb_in = xp.asarray(sin, dtype=s.dtype)
         # initial field
         init = c.turb_init or {}
         k0 = init.get("k", 1.5 * (c.turb_intensity * self.u_ref) ** 2)
@@ -285,7 +292,7 @@ class TurbulenceModel:
         self.relax_k = c.relax_k if c.relax_k is not None else self.default_relax
         self.relax_w = c.relax_w if c.relax_w is not None else self.default_relax
         self._mu_w = None  # effective wall viscosity per boundary face
-        self.yplus = np.zeros(s.fv.n_bf)
+        self.yplus = xp.zeros(s.fv.n_bf, dtype=s.dtype)
         self._update_mut(None)
 
     # ------------------------------------------------------------------
@@ -343,14 +350,14 @@ class TurbulenceModel:
         mut_f = fv.face_interp(self.mut)
         mub = self.mu + self.mut[fv.Pb]
         mu_w = self.wall_shear_viscosity(U)
-        mub = xp.where(xp.asarray(self.wall_b), xp.asarray(mu_w, dtype=s.dtype), mub)
+        mub = xp.where(self.wall_b_d, mu_w, mub)
         return self.mu + mut_f, mub
 
     def energy_diffusivity(self, k_over_cp: float):
         fv = self.s.fv
         mut_f = fv.face_interp(self.mut)
         pr_t = self.s.case.prandtl_turbulent
-        gb = k_over_cp + self.xp.where(self.xp.asarray(self.wall_b), 0.0, self.mut[fv.Pb] / pr_t)
+        gb = k_over_cp + self.xp.where(self.wall_b_d, 0.0, self.mut[fv.Pb] / pr_t)
         return k_over_cp + mut_f / pr_t, gb
 
     def transpose_stress(self, gU, viscosity):
@@ -376,8 +383,8 @@ class TurbulenceModel:
         """Boundary values: fixed at inlets and outlet backflow, zero-gradient elsewhere."""
         s, xp = self.s, self.xp
         fv = s.fv
-        fixed = xp.asarray(self.inlet_b) | (xp.asarray(self.open_b) & (s.Fb < 0))
-        vals = xp.where(fixed, xp.asarray(inflow_vals, dtype=s.dtype), phi[fv.Pb])
+        fixed = self.inlet_b_d | (self.open_b_d & (s.Fb < 0))
+        vals = xp.where(fixed, inflow_vals, phi[fv.Pb])
         return vals, fixed.astype(s.dtype)
 
     def _transport(self, phi, inflow_vals, sigma_mut, Sc, Sp, relax, fixed_cells=None, fixed_vals=None,
@@ -394,7 +401,7 @@ class TurbulenceModel:
         diag = diag + Sp * fv.vol
         diag, rhs = s._time_terms(name, phi, diag, rhs)  # transient runs: d(rho phi)/dt (no-op when steady)
         if fixed_cells is not None and fixed_cells.size:
-            big = 1e10 * float(xp.max(diag))
+            big = 1e10 * xp.max(diag)
             fc = xp.asarray(fixed_cells)
             diag[fc] = diag[fc] + big
             rhs[fc] = rhs[fc] + big * xp.asarray(fixed_vals, dtype=s.dtype)
@@ -405,8 +412,8 @@ class TurbulenceModel:
         mask = phi > floor * (1.0 + 1e-9)
         if fixed_cells is not None and fixed_cells.size:
             mask[xp.asarray(fixed_cells)] = False
-        r = xp.abs(rhs - A @ phi)[mask]
-        den = xp.abs(diag * phi)[mask]
+        r = xp.where(mask, xp.abs(rhs - A @ phi), 0.0)
+        den = xp.where(mask, xp.abs(diag * phi), 0.0)
         res = float(xp.sum(r)) / max(float(xp.sum(den)), 1e-300)
         dr = diag / relax
         Ar = fv.matrix(dr, aPN, aNP)
@@ -430,7 +437,7 @@ class TurbulenceModel:
         yp = np.zeros(self.s.nc)
         Pb = h(self.s.fv.Pb)
         if self.wall_faces.size:
-            np.maximum.at(yp, Pb[self.wall_faces], self.yplus[self.wall_faces])
+            np.maximum.at(yp, Pb[self.wall_faces], h(self.yplus)[self.wall_faces])
         out["y-plus"] = yp
         return out
 
@@ -445,20 +452,22 @@ class TurbulenceModel:
             self.w = xp.asarray(st["w"], dtype=dt)
             self.mut = xp.asarray(st["mut"], dtype=dt)
 
-    def wall_shear(self) -> np.ndarray:
-        """Wall shear stress magnitude on every boundary face (0 off walls)."""
-        h = self.s.be.to_numpy
-        fv = self.s.fv
-        U = h(self.s.U).astype(np.float64)
-        Pb = h(fv.Pb)
-        nb = h(fv.nb).astype(np.float64)
-        UP = U[Pb]
-        ut = UP - np.einsum("fd,fd->f", UP, nb)[:, None] * nb
-        ub = h(self.s.ub_fixed).astype(np.float64)
-        ut = ut - (ub - np.einsum("fd,fd->f", ub, nb)[:, None] * nb)
-        mag = np.linalg.norm(ut, axis=1)
+    def _wall_tangential_speed(self, U):
+        fv, xp = self.s.fv, self.xp
+        relative = U[fv.Pb] - self.s.ub_fixed
+        tangential = relative - xp.sum(relative * fv.nb, axis=1)[:, None] * fv.nb
+        return xp.linalg.norm(tangential, axis=1)
+
+    def _wall_shear_device(self):
+        xp = self.xp
+        speed = self._wall_tangential_speed(self.s.U)
         mu_w = self.wall_shear_viscosity(self.s.U)
-        return np.where(self.wall_b, mu_w * mag / np.maximum(self.yb, 1e-300), 0.0)
+        distance = xp.where(self.wall_b_d, self.yb_d, 1.0)
+        return xp.where(self.wall_b_d, mu_w * speed / distance, 0.0)
+
+    def wall_shear(self) -> np.ndarray:
+        """Report the wall shear magnitude on every boundary face."""
+        return self.s.be.to_numpy(self._wall_shear_device())
 
 
 class KOmegaSST(TurbulenceModel):
@@ -501,32 +510,22 @@ class KOmegaSST(TurbulenceModel):
 
     def _omega_wall(self):
         """Near-wall cell omega: sqrt(omega_vis^2 + omega_log^2)."""
-        h = self.s.be.to_numpy
-        yc = self.y_wall_cell[self.wall_cells]
-        k = h(self.k)[self.wall_cells].astype(np.float64)
-        w_vis = 6.0 * self.nu / (self.b1 * yc ** 2)
-        w_log = np.sqrt(np.maximum(k, 0.0)) / (CMU ** 0.25 * KAPPA * yc)
-        return np.sqrt(w_vis ** 2 + w_log ** 2)
+        xp = self.xp
+        yc = self.wall_distance_d
+        k = self.k[self.wall_cells_d]
+        w_vis = 6.0 * self.nu / (self.b1 * yc**2)
+        w_log = xp.sqrt(xp.maximum(k, 0.0)) / (CMU ** 0.25 * KAPPA * yc)
+        return xp.hypot(w_vis, w_log)
 
     def wall_shear_viscosity(self, U):
-        s = self.s
-        h = s.be.to_numpy
-        fv = s.fv
-        Uh = h(U).astype(np.float64)
-        Pb = h(fv.Pb)
-        nb = h(fv.nb).astype(np.float64)
-        ub = h(s.ub_fixed).astype(np.float64)
-        rel = Uh[Pb] - ub
-        ut = np.linalg.norm(rel - np.einsum("fd,fd->f", rel, nb)[:, None] * nb, axis=1)
-        re_y = ut * self.yb / self.nu
-        up = spalding_uplus(re_y)
+        xp = self.xp
+        re_y = self._wall_tangential_speed(U) * self.yb_d / self.nu
+        up = spalding_uplus(re_y, xp=xp).astype(self.s.dtype, copy=False)
         ok = (re_y > 1e-12) & (up > 0)
-        mu_w = np.full(re_y.shape, self.mu)
-        mu_w[ok] = self.mu * re_y[ok] / up[ok] ** 2  # tau_w = mu_w u_t / y with u_tau = u_t / u+
-        yp = np.zeros(re_y.shape)
-        yp[ok] = re_y[ok] / up[ok]
-        self.yplus = np.where(self.wall_b, yp, 0.0)
-        return np.where(self.wall_b, mu_w, self.mu)
+        safe_up = xp.where(ok, up, 1.0)
+        mu_w = xp.where(ok, self.mu * re_y / safe_up**2, self.mu)
+        self.yplus = xp.where(self.wall_b_d & ok, re_y / safe_up, 0.0)
+        return xp.where(self.wall_b_d, mu_w, self.mu)
 
     def solve(self, gU) -> Dict[str, float]:
         s, xp = self.s, self.xp
@@ -546,7 +545,7 @@ class KOmegaSST(TurbulenceModel):
         Sc = bl(self.g1, self.g2) * rho * limited_strain + xp.maximum(cdt, 0.0)
         Sp = bl(self.b1, self.b2) * rho * w + xp.maximum(-cdt, 0.0) / w
         wnew, rw = self._transport(w, self.sb_in, bl(self.sw1, self.sw2), Sc, Sp, self.relax_w,
-                                   fixed_cells=self.wall_cells, fixed_vals=self._omega_wall(), floor=self.w_min, name="w")
+                                   fixed_cells=self.wall_cells_d, fixed_vals=self._omega_wall(), floor=self.w_min, name="w")
         self.k, self.w = knew, wnew
         self._update_mut(S)
         return {"k": rk, "omega": rw}
@@ -605,49 +604,37 @@ class KEpsilonRealizable(TurbulenceModel):
         self.mut = r * (self.rho * cmu * self.k ** 2 / self.w) + (1.0 - r) * self.mut
 
     def _ustar(self):
-        h = self.s.be.to_numpy
-        Pb = h(self.s.fv.Pb)
-        k = h(self.k).astype(np.float64)
-        return CMU ** 0.25 * np.sqrt(np.maximum(k[Pb], 0.0))
+        return CMU ** 0.25 * self.xp.sqrt(self.xp.maximum(self.k[self.s.fv.Pb], 0.0))
 
     def wall_shear_viscosity(self, U):
+        xp = self.xp
         us = self._ustar()
-        ystar = np.maximum(self.rho * us * self.yb / self.mu, YSTAR_LIM)
-        mu_w = self.rho * KAPPA_WALL * us * self.yb / np.log(E_WALL * ystar)
-        mu_w = np.maximum(mu_w, self.mu)
-        self.yplus = np.where(self.wall_b, self.rho * us * self.yb / self.mu, 0.0)
-        return np.where(self.wall_b, mu_w, self.mu)
+        ystar = xp.maximum(self.rho * us * self.yb_d / self.mu, YSTAR_LIM)
+        mu_w = self.rho * KAPPA_WALL * us * self.yb_d / xp.log(E_WALL * ystar)
+        self.yplus = xp.where(self.wall_b_d, self.rho * us * self.yb_d / self.mu, 0.0)
+        return xp.where(self.wall_b_d, xp.maximum(mu_w, self.mu), self.mu)
 
     def solve(self, gU) -> Dict[str, float]:
         s, xp = self.s, self.xp
-        h = s.be.to_numpy
         rho, k, eps = self.rho, self.k, self.w
-        cmu, S = self._cmu(gU)
+        _, S = self._cmu(gU)
         Gk = self.mut * S * S
-        # wall cells: production from the wall shear, epsilon from equilibrium
-        if self.wall_cells.size:
-            tau = self.wall_shear()
-            Pb = h(s.fv.Pb)
+        wc = self.wall_cells_d
+        if wc.size:
+            tau = self._wall_shear_device()
             us = self._ustar()
-            area = h(s.fv.Sb_mag).astype(np.float64)
-            wf, wc = self.wall_faces, self.wall_cells
-            # G_k = tau_w dU/dy|_P = tau_w^2 / (kappa rho u* y_P), area-averaged over the cell's wall faces
-            prod = tau * tau / (KAPPA_WALL * rho * np.maximum(us, 1e-300) * np.maximum(self.yb, 1e-300))
-            num = np.bincount(Pb[wf], (prod * area)[wf], minlength=s.nc)
-            den = np.bincount(Pb[wf], area[wf], minlength=s.nc)
-            Gk_h = h(Gk).astype(np.float64)
-            Gk_h[wc] = num[wc] / np.maximum(den[wc], 1e-300)
-            Gk = xp.asarray(Gk_h, dtype=s.dtype)
-            kc = h(k).astype(np.float64)[wc]
-            eps_w = CMU ** 0.75 * np.maximum(kc, 0.0) ** 1.5 / (KAPPA_WALL * self.y_wall_cell[wc])
-        else:
-            eps_w = np.zeros(0)
+            floor = np.finfo(s.dtype).tiny
+            denom = KAPPA_WALL * rho * us * self.yb_d
+            prod = tau**2 / xp.maximum(denom, floor)
+            total = s.fv.Cb_d @ (prod * self.wall_area_d)
+            Gk[wc] = total[wc] / xp.maximum(self.wall_area_cell_d[wc], floor)
+        eps_w = CMU ** 0.75 * xp.maximum(k[wc], 0.0) ** 1.5 / (KAPPA_WALL * self.wall_distance_d)
         knew, rk = self._transport(k, self.kb_in, 1.0 / self.sk, Gk, rho * eps / k, self.relax_k, floor=self.k_min, name="k")
         # epsilon sources with the freshly updated k: lagging k here lets the two
         # equations drift apart (eps/k blows up and k collapses to zero)
         Sc, Sp = self._eps_sources(S, knew, eps, Gk * (knew / k))
         enew, re = self._transport(eps, self.sb_in, 1.0 / self.se, Sc, Sp, self.relax_w,
-                                   fixed_cells=self.wall_cells, fixed_vals=eps_w, floor=self.w_min, name="w")
+                                   fixed_cells=self.wall_cells_d, fixed_vals=eps_w, floor=self.w_min, name="w")
         self.k, self.w = knew, enew
         self._update_mut(gU)
         return {"k": rk, "epsilon": re}

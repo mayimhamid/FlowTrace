@@ -157,3 +157,110 @@ def test_3d_extruded_cavity_is_two_dimensional():
     assert f["x-velocity"].min() < -0.15
     r = s.residuals()["scaled"]
     assert r["z-velocity"] < 1e-3
+
+
+def test_wlsq_over_relaxed_flux_and_limiter_on_distorted_mesh():
+    from flowtrace.unstructured.fvmesh import FVMesh
+
+    mesh = cartesian_mesh_2d(9, 7, triangulate=True, warp=0.06)
+    fv = FVMesh(mesh, be, cell_order="rcm")
+    gradient = np.array([2.2, -1.4])
+    phi, phib = fv.xc @ gradient + 3.0, fv.xfb @ gradient + 3.0
+    reconstructed = fv.gradient(phi, phib)
+    np.testing.assert_allclose(reconstructed, np.broadcast_to(gradient, reconstructed.shape), atol=5e-13)
+    flux = fv.alpha * (phi[fv.N] - phi[fv.P]) + np.sum(fv.face_interp_vec(reconstructed) * fv.Tvec, axis=1)
+    np.testing.assert_allclose(flux, fv.S @ gradient, atol=1e-13)
+    constant = np.ones(fv.nc)
+    flat = fv.venkat_limiter(constant, np.ones(fv.n_bf), np.zeros_like(reconstructed), 0.0)
+    np.testing.assert_array_equal(flat, 1.0)
+    limited = fv.venkat_limiter(phi, phib, reconstructed * 100.0, 0.0)
+    assert np.all((limited >= 0.0) & (limited < 1.0))
+
+
+def test_rcm_fluent_cell_data_roundtrip(tmp_path):
+    from flowtrace.mesh.fluent_h5 import read_data_h5, write_data_h5
+    from flowtrace.mesh.unstructured import compute_geometry
+
+    mesh = cartesian_mesh_2d(9, 6)
+    case = UnstructuredCase(cell_order="rcm", energy=True, conductivity=0.02,
+                            boundaries={"top": BoundarySpec("wall", velocity=[1.0, 0.0]),
+                                        "left": BoundarySpec("wall", thermal="temperature", value=1.0),
+                                        "right": BoundarySpec("wall", thermal="temperature", value=0.0)},
+                            max_iter=1200, tol=1e-8, lanes="off")
+    solver = SimpleSolver(mesh, case, be)
+    perm, inv = solver.fv.mesh.perm, solver.fv.mesh.inv_perm
+    np.testing.assert_array_equal(inv[perm], np.arange(mesh.n_cells))
+    assert np.any(perm != np.arange(mesh.n_cells))
+    centres = compute_geometry(mesh).cell_centre
+    np.testing.assert_array_equal(solver.cell_centres(), centres)
+    solver.initialize({"temperature": centres[:, 0] + 2.0 * centres[:, 1]})
+    np.testing.assert_array_equal(solver.fields(["temperature"])["temperature"], centres[:, 0] + 2.0 * centres[:, 1])
+    run(solver)
+    assert solver.converged
+    fields = solver.fields(["temperature", "pressure", "x-velocity"])
+    path = tmp_path / "rcm.dat.h5"
+    write_data_h5(str(path), solver.mesh, fields)
+    exported = read_data_h5(str(path), mesh.n_cells)
+    for key, values in fields.items():
+        np.testing.assert_array_equal(exported[key], values)
+    np.testing.assert_array_equal(exported["temperature"], solver.T[inv])
+
+
+def test_mixed_precision_recovers_true_fp64_residual():
+    from scipy.sparse import diags
+    from flowtrace.linalg.krylov import refined_krylov
+
+    diagonal = np.geomspace(1.0, 1e5, 36)
+    matrix = diags([-0.35 * diagonal[1:], diagonal, 0.15 * diagonal[:-1]], [-1, 0, 1], format="csr")
+    exact = np.sin(np.arange(36))
+    rhs = matrix @ exact
+    result, info = refined_krylov(matrix, rhs, np, lambda x: x / diagonal.astype(x.dtype),
+                                  None, 1e-11, 60)
+    assert info.converged
+    assert np.linalg.norm(rhs - matrix @ result) / np.linalg.norm(rhs) < 1e-11
+    np.testing.assert_allclose(result, exact, atol=1e-7)
+
+
+def test_convection_wall_conserves_analytic_slab_heat_flow():
+    mesh = cartesian_mesh_2d(8, 3)
+    case = UnstructuredCase(energy=True, conductivity=2.0, max_iter=500, tol=1e-14, lanes="off",
+                            boundaries={
+                                "left": BoundarySpec(thermal="temperature", value=1.0),
+                                "right": BoundarySpec(thermal="convection", value=0.0, heat_transfer_coefficient=2.0),
+                            })
+    solver = run(SimpleSolver(mesh, case, be))
+    assert solver.converged
+    expected_flux = 1.0 / (1.0 / case.conductivity + 1.0 / 2.0)
+    values = solver.heat_flow()
+    np.testing.assert_allclose([values["left"], values["right"]], [expected_flux, -expected_flux], atol=1e-12, rtol=0)
+    assert abs(sum(values.values())) < 1e-12
+    exact = 1.0 - expected_flux * solver.cell_centres()[:, 0] / case.conductivity
+    np.testing.assert_allclose(solver.fields()["temperature"], exact, atol=1e-12, rtol=0)
+
+
+def test_consistent_rhie_chow_cavity_relaxation_invariance():
+    mesh = cartesian_mesh_2d(16, 16)
+    solutions = []
+    for relax_u in (0.3, 0.7):
+        case = UnstructuredCase(rhie_chow="consistent", viscosity=0.001, relax_u=relax_u,
+                                pressure_tol=0.001, tol=1e-9, max_iter=4500, lanes="off",
+                                boundaries={"top": BoundarySpec("wall", velocity=[1.0, 0.0])})
+        solver = run(SimpleSolver(mesh, case, be))
+        assert solver.converged
+        solutions.append(solver.fields(["x-velocity", "y-velocity", "pressure"]))
+    for name, values in solutions[0].items():
+        np.testing.assert_allclose(values, solutions[1][name], rtol=0, atol=1e-6)
+
+
+def test_open_heated_duct_closes_mass_and_energy_balances():
+    mesh = cartesian_mesh_2d(18, 8, lx=4.0, names=("inlet", "outlet", "bottom", "top"),
+                             types=("velocity-inlet", "pressure-outlet", "wall", "wall"))
+    case = UnstructuredCase(energy=True, init_T=1.0, conductivity=0.03, viscosity=0.05,
+                            pressure_tol=0.001, tol=1e-13, max_iter=2500, lanes="off",
+                            boundaries={"inlet": BoundarySpec("inlet", normal_speed=1.0, value=1.0),
+                                        "outlet": BoundarySpec("outlet"),
+                                        "bottom": BoundarySpec(thermal="temperature", value=2.0)})
+    solver = run(SimpleSolver(mesh, case, be))
+    assert solver.converged
+    for balance in (solver.mass_balance(), solver.heat_flow()):
+        assert abs(sum(balance.values())) / abs(balance["inlet"]) < 1e-12

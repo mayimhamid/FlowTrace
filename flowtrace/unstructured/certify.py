@@ -237,11 +237,11 @@ def certify(solver, levels: int = 2, make_solver: Optional[Callable] = None, run
         raise RuntimeError("the mesh certificate needs at least one refined level")
     fine, coarse = chain[-1], chain[-2]
     r = math.sqrt(cells[-1] / cells[-2])
-    p_formal = 2.0 if solver.case.scheme == "second-order" else 1.0
-    Uf = h(fine.U).astype(np.float64)
-    Uc = h(coarse.U).astype(np.float64)
-    vol_f = h(fine.fv.vol).astype(np.float64)
-    vol_c = h(coarse.fv.vol).astype(np.float64)
+    p_formal = 2.0 if solver.case.scheme in ("second-order", "venkatakrishnan") else 1.0
+    Uf = fine.fv.to_original(h(fine.U).astype(np.float64))
+    Uc = coarse.fv.to_original(h(coarse.U).astype(np.float64))
+    vol_f = fine.fv.to_original(h(fine.fv.vol).astype(np.float64))
+    vol_c = coarse.fv.to_original(h(coarse.fv.vol).astype(np.float64))
     u_ref = max(float(np.linalg.norm(Uf, axis=1).max()), 1e-300)
     R = np.stack([_restrict(Uf[:, k], vol_f, parent, coarse.nc) for k in range(solver.dim)], axis=1)
     diff = np.linalg.norm(Uc - R, axis=1) / u_ref  # per coarse cell

@@ -131,6 +131,10 @@ BLOCK = 256
 
 def available() -> bool:
     global _module, _failed
+    import sys
+
+    if getattr(sys.modules.get("cupy"), "__fake__", False):
+        return False
     if os.environ.get("FLOWTRACE_NO_CUDA_KERNELS"):
         return False
     if _module is not None:

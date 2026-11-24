@@ -686,7 +686,8 @@ function onFrame(ev) {
   }
   sel.value = ev.field;
   $("#empty").classList.add("hidden");
-  $("#frameInfo").textContent = ev.mesh === "structured" ? `${ev.grid[0]}×${ev.grid[1]} · step ${ev.step}` : `${ev.cells.toLocaleString()} cells · it ${ev.step}`;
+  const frameInfo = ev.mesh === "structured" ? `${ev.grid[0]}×${ev.grid[1]} · step ${ev.step}` : `${ev.cells.toLocaleString()} cells · it ${ev.step}`;
+  $("#frameInfo").textContent = Number.isFinite(ev.physical_time) ? `${frameInfo} · t ${fmt(ev.physical_time)} s` : frameInfo;
   draw();
 }
 function resultHeadline(res) {
@@ -1006,7 +1007,7 @@ function drawUnstructured(ctx, W, H, f, cmap) {
     // node-interpolated shading: every cell as a fan of triangles (centroid, corner, corner)
     const dpr = window.devicePixelRatio || 1, q = Math.min(dpr, Math.sqrt(2.5e6 / Math.max(1, W * H)));
     const rw = Math.max(1, Math.round(W * q)), rh = Math.max(1, Math.round(H * q));
-    const [img] = rasterCells(g, [f.values], rw, rh, (x) => (vr.x + (x - x0) * vr.s) * rw / W, (y) => (vr.y + vr.h - (y - y0) * vr.s) * rh / H);
+    const [img] = rasterCells(g, [f.values], rw, rh, "field", [W, H], (x) => (vr.x + (x - x0) * vr.s) * rw / W, (y) => (vr.y + vr.h - (y - y0) * vr.s) * rh / H);
     off.width = rw; off.height = rh;
     const octx = off.getContext("2d"); const id = octx.createImageData(rw, rh); const d = id.data;
     for (let i = 0; i < rw * rh; i++) {
@@ -1029,7 +1030,7 @@ function drawUnstructured(ctx, W, H, f, cmap) {
     // velocity on a regular grid over the bounding box (NaN outside the domain), then as for structured cases
     const lx = x1 - x0, ly = y1 - y0, m = 150 / Math.max(lx, ly);
     const vnx = Math.max(8, Math.round(lx * m)), vny = Math.max(8, Math.round(ly * m));
-    const [u, v] = rasterCells(g, [f.u, f.v], vnx, vny, (x) => (x - x0) / lx * vnx, (y) => (y - y0) / ly * vny);
+    const [u, v] = rasterCells(g, [f.u, f.v], vnx, vny, "velocity", [], (x) => (x - x0) / lx * vnx, (y) => (y - y0) / ly * vny);
     const vf = { vnx, vny, lx, ly, u, v, sep: 3, steps: 1500 };
     if (wantS) drawStreamlines(ctx, vf, vr);
     if (wantV) drawVectors(ctx, vf, vr);
@@ -1039,14 +1040,42 @@ function drawUnstructured(ctx, W, H, f, cmap) {
 /* Cell values -> node values (mean of the cells around a node) -> linear interpolation over each cell's
    triangle fan, sampled at the centres of a W x H grid. X, Y map mesh coordinates to grid coordinates.
    Returns one Float32Array per channel, NaN outside the mesh. */
-function rasterCells(g, chans, W, H, X, Y) {
-  const nn = g.nodes.length / 2, nch = chans.length;
-  const cnt = new Float32Array(nn); const nodeV = chans.map(() => new Float32Array(nn));
-  for (let c = 0; c < g.cells; c++) for (let k = g.ptr[c]; k < g.ptr[c + 1]; k++) { const n = g.loops[k]; cnt[n]++; for (let q = 0; q < nch; q++) nodeV[q][n] += chans[q][c]; }
-  for (let n = 0; n < nn; n++) if (cnt[n]) for (let q = 0; q < nch; q++) nodeV[q][n] /= cnt[n];
+const meshRasterCache = new WeakMap();
+function rasterCells(g, chans, W, H, slot, viewport, X, Y) {
+  let cache = meshRasterCache.get(g);
+  if (!cache) { cache = new Map(); meshRasterCache.set(g, cache); }
+  const key = [W, H, ...viewport].join("/");
+  let grid = cache.get(slot);
+  if (!grid || grid.key !== key) {
+    grid = buildMeshRaster(g, W, H, X, Y);
+    grid.key = key;
+    cache.set(slot, grid);
+  }
+  const { cell, nodeA, nodeB, weightCell, weightA, count } = grid;
+  return chans.map(values => {
+    const nodeValues = new Float32Array(count.length);
+    for (let c = 0; c < g.cells; c++) {
+      for (let k = g.ptr[c]; k < g.ptr[c + 1]; k++) nodeValues[g.loops[k]] += values[c];
+    }
+    for (let n = 0; n < count.length; n++) if (count[n]) nodeValues[n] /= count[n];
+    const out = new Float32Array(cell.length).fill(NaN);
+    for (let i = 0; i < cell.length; i++) {
+      if (cell[i] < 0) continue;
+      const w0 = weightCell[i], w1 = weightA[i];
+      out[i] = w0 * values[cell[i]] + w1 * nodeValues[nodeA[i]] + (1 - w0 - w1) * nodeValues[nodeB[i]];
+    }
+    return out;
+  });
+}
+function buildMeshRaster(g, W, H, X, Y) {
+  const nn = g.nodes.length / 2;
+  const count = new Uint32Array(nn);
+  for (const n of g.loops) count[n]++;
+  const size = W * H;
+  const cell = new Int32Array(size).fill(-1), nodeA = new Int32Array(size), nodeB = new Int32Array(size);
+  const weightCell = new Float64Array(size), weightA = new Float64Array(size);
   const px = new Float32Array(nn), py = new Float32Array(nn);
   for (let n = 0; n < nn; n++) { px[n] = X(g.nodes[2 * n]); py[n] = Y(g.nodes[2 * n + 1]); }
-  const out = chans.map(() => new Float32Array(W * H).fill(NaN));
   const eps = -1e-3;
   for (let c = 0; c < g.cells; c++) {
     const s = g.ptr[c], e = g.ptr[c + 1]; let cx = 0, cy = 0;
@@ -1063,11 +1092,16 @@ function rasterCells(g, chans, W, H, X, Y) {
         const w0 = ((ay - by) * (x - bx) + (bx - ax) * (y - by)) / den; if (w0 < eps) continue;
         const w1 = ((by - cy) * (x - bx) + (cx - bx) * (y - by)) / den; if (w1 < eps) continue;
         const w2 = 1 - w0 - w1; if (w2 < eps) continue;
-        for (let q = 0; q < nch; q++) out[q][j * W + i] = w0 * chans[q][c] + w1 * nodeV[q][a] + w2 * nodeV[q][b];
+        const pixel = j * W + i;
+        cell[pixel] = c;
+        nodeA[pixel] = a;
+        nodeB[pixel] = b;
+        weightCell[pixel] = w0;
+        weightA[pixel] = w1;
       }
     }
   }
-  return out;
+  return { cell, nodeA, nodeB, weightCell, weightA, count };
 }
 const FIELD_UNITS = { pressure: "Pa", temperature: "K", "turb-kinetic-energy": "m²/s²", "turb-diss-rate": "m²/s³", "specific-diss-rate": "1/s",
   "viscosity-turb": "Pa·s", "wall-distance": "m", "y-plus": "", "viscosity-ratio": "", "mesh-error-estimate": "fraction of max speed", vorticity: "1/s" };

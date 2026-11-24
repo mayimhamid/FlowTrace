@@ -186,13 +186,20 @@ def test_technical_report_has_sections_colour_figures_and_valid_svg(tmp_path):
               app.hub, app.workdir, meshes=app.meshes)
     app.job = job
     job.start()
-    job.join(120)
-    assert job.status == "converged", job.error
+    from queue import Empty
+    from time import monotonic
+
     progress = []
-    while not q.empty():
-        ev = q.get()
+    deadline = monotonic() + 120
+    while monotonic() < deadline and (job.running or not q.empty()):
+        try:
+            ev = q.get(timeout=0.1)
+        except Empty:
+            continue
         if ev.get("type") == "progress":
             progress.append(ev["fraction"])
+    job.join(0)
+    assert job.status == "converged", job.error
     assert progress and progress[-1] == 1.0 and progress == sorted(progress)  # the loading screen never goes backwards
     html = run_report_html(app, job)
     for heading in ("1. Problem description", "2. Numerical methods", "3. Computing environment", "4. Results",

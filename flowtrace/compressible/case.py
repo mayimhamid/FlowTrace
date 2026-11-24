@@ -111,8 +111,11 @@ class CompressibleCase:
     monitor_interval: int = 10
     dual_time_iterations: int = 100
     dual_time_tol: float = 1e-7
+    cell_order: str = "input"  # input | rcm
 
     def __post_init__(self):
+        if self.cell_order not in ("input", "rcm"):
+            raise ValueError("cell_order must be input or rcm")
         self.boundaries = {k: (CompBC(**v) if isinstance(v, dict) else v) for k, v in self.boundaries.items()}
         if isinstance(self.gas, dict):
             self.gas = GasModel(**self.gas)

@@ -119,3 +119,137 @@ def bicgstab(A: Callable, b, xp, M: Optional[Callable] = None, x0=None, tol: flo
         if omega == 0.0:
             break
     return x, KrylovInfo(k, rnorm / bnorm, False)
+
+
+def device_krylov(A, b, xp, M, x0, tol, maxiter, *, symmetric=False, project=None, relative_to_initial=False):
+    """Krylov iterations with device scalars and a host convergence check per batch.
+
+    Mask converged or broken-down recurrences so the remaining batch steps
+    cannot alter their solution. The final residual is recomputed with A.
+    """
+    x = xp.zeros_like(b) if x0 is None else x0.copy()
+    r = b - A(x) if x0 is not None else b.copy()
+    if project is not None:
+        r = project(r)
+    dot = lambda a, b: xp.vdot(a, b).real
+    norm2 = lambda v: dot(v, v)
+    start2 = norm2(r)
+    b2 = norm2(b)
+    scale2 = start2 if relative_to_initial else b2
+    scale2 = xp.where(scale2 > 0, scale2, 1.0)
+    target = xp.maximum(tol**2 * scale2, 1e-28 * b2)
+    active = start2 > target
+    if not bool(active):
+        return x, KrylovInfo(0, float(xp.sqrt(start2 / scale2)), bool(xp.isfinite(start2)))
+
+    def ratio(numerator, denominator):
+        good = xp.isfinite(numerator) & xp.isfinite(denominator) & (denominator != 0)
+        return xp.where(good, numerator / xp.where(good, denominator, 1), 0), good
+
+    count = xp.zeros((), dtype=xp.int32)
+    if symmetric:
+        z = M(r)
+        if project is not None:
+            z = project(z)
+        direction = z.copy()
+        rz = dot(r, z)
+    else:
+        shadow = r.copy()
+        direction = xp.zeros_like(b)
+        v = xp.zeros_like(b)
+        rho = alpha = omega = xp.ones((), dtype=b.dtype)
+    batch_size = 4
+    for k in range(maxiter):
+        count = count + active.astype(xp.int32)
+        if symmetric:
+            q = A(direction)
+            dq = dot(direction, q)
+            step, valid = ratio(rz, dq)
+            live = active & valid & (dq > 0)
+            correction = step * direction
+            next_r = r - step * q
+            continuation = rz != 0
+        else:
+            next_rho = dot(shadow, r)
+            beta, valid_beta = ratio(next_rho * alpha, rho * omega)
+            direction = r + beta * (direction - omega * v)
+            y = M(direction)
+            v = A(y)
+            alpha, valid_alpha = ratio(next_rho, dot(shadow, v))
+            short_r = r - alpha * v
+            short = norm2(short_r) <= target
+            z = M(short_r)
+            q = A(z)
+            omega, valid_omega = ratio(dot(q, short_r), norm2(q))
+            live = active & valid_beta & valid_alpha & (next_rho != 0)
+            live = live & (short | valid_omega)
+            omega = xp.where(short, 0, omega)
+            correction = alpha * y + omega * z
+            next_r = short_r - omega * q
+            rho = next_rho
+            continuation = short | (omega != 0)
+        residual2 = norm2(next_r)
+        accepted = live & xp.isfinite(residual2)
+        x = xp.where(accepted, x + correction, x)
+        r = xp.where(accepted, next_r, r)
+        active = accepted & continuation & (residual2 > target)
+        if (k == 0 or (k + 1) % batch_size == 0 or k + 1 == maxiter) and not bool(active):
+            break
+        if symmetric:
+            z = M(r)
+            if project is not None:
+                z = project(z)
+            next_rz = dot(r, z)
+            beta, valid_beta = ratio(next_rz, rz)
+            direction = z + beta * direction
+            active = active & valid_beta
+            rz = next_rz
+    true_r = b - A(x)
+    if project is not None:
+        true_r = project(true_r)
+    true2 = norm2(true_r)
+    return x, KrylovInfo(int(count), float(xp.sqrt(true2 / scale2)), bool(true2 <= target))
+
+
+def refined_krylov(A, b, xp, M, x0, tol, maxiter, *, symmetric=False, project=None, relative_to_initial=False,
+                  device=False):
+    """FP32 inner solves with FP64 residuals, updates and FP64 recovery."""
+    A32 = getattr(A, "csr", A).astype(xp.float32)
+
+    def solve(operator, rhs, guess, target, limit):
+        matvec = lambda v: operator @ v
+        precondition = lambda v: M(v).astype(v.dtype, copy=False)
+        if device:
+            return device_krylov(matvec, rhs, xp, precondition, guess, target, limit, symmetric=symmetric,
+                                 project=project, relative_to_initial=relative_to_initial)
+        if symmetric:
+            return pcg(matvec, rhs, xp, M=precondition, x0=guess, tol=target, maxiter=limit, project=project)
+        return bicgstab(matvec, rhs, xp, M=precondition, x0=guess, tol=target, maxiter=limit,
+                        relative_to_initial=relative_to_initial)
+
+    x = xp.zeros_like(b) if x0 is None else x0.copy()
+    residual = b - A @ x
+    norm_b = float(xp.linalg.norm(b))
+    initial = float(xp.linalg.norm(project(residual) if project is not None else residual))
+    scale = (initial if relative_to_initial else norm_b) or 1.0
+    target = max(tol * scale, 1e-14 * norm_b)
+    previous = initial
+    count = 0
+    for _ in range(3):
+        if previous <= target or count >= maxiter:
+            break
+        correction, info = solve(A32, residual.astype(xp.float32), None, max(tol * 0.25, 1e-4), maxiter - count)
+        count += info.iterations
+        candidate = x + correction.astype(x.dtype)
+        residual = b - A @ candidate
+        error = float(xp.linalg.norm(project(residual) if project is not None else residual))
+        if not math.isfinite(error) or error >= 0.95 * previous:
+            break
+        x, previous = candidate, error
+    if previous <= target:
+        return x, KrylovInfo(count, previous / scale, True)
+    # If the FP32 recurrence stalls, the FP64 solve keeps its normal iteration budget.
+    x, info = solve(A, b, x, tol if not relative_to_initial else target / previous, maxiter)
+    residual = b - A @ x
+    error = float(xp.linalg.norm(project(residual) if project is not None else residual))
+    return x, KrylovInfo(count + info.iterations, error / scale, error <= target)

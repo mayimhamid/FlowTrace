@@ -148,7 +148,8 @@ def run_mac(grids: Sequence[int] = (16, 32, 64), nu: float = 0.5, kappa: float =
 def run_simplec(grids: Sequence[int] = (12, 24, 48), mu: float = 0.5, k: float = 0.5, energy: bool = True,
                 triangulate: bool = False, warp: float = 0.0, scheme: str = "second-order",
                 backend: str = "numpy", tol: float = 1e-8, max_iter: int = 20000,
-                pressure_gradient: str = "green-gauss") -> MMSResult:
+                pressure_gradient: str = "green-gauss", cell_order: str = "input",
+                rhie_chow: str = "legacy") -> MMSResult:
     """Steady MMS on the unstructured SIMPLEC solver (quads or triangles).
 
     ``warp`` distorts the mesh smoothly (non-orthogonal, skewed cells) so the
@@ -169,7 +170,7 @@ def run_simplec(grids: Sequence[int] = (12, 24, 48), mu: float = 0.5, k: float =
         case = UnstructuredCase(name=f"MMS SIMPLEC n={n}", boundaries={s: wall for s in ("left", "right", "bottom", "top")},
                                 density=1.0, viscosity=mu, energy=energy, conductivity=k, cp=1.0,
                                 scheme=scheme, max_iter=max_iter, tol=tol, backend=backend, relax_u=0.8,
-                                pressure_gradient=pressure_gradient)
+                                pressure_gradient=pressure_gradient, cell_order=cell_order, rhie_chow=rhie_chow)
         t0 = time.perf_counter()
         s = SimpleSolver(mesh, case, backend=be)
         xc = s.cell_centres()
@@ -181,7 +182,7 @@ def run_simplec(grids: Sequence[int] = (12, 24, 48), mu: float = 0.5, k: float =
         its.append(s.iteration)
         f = s.fields()
         ex = exact(xc[:, 0], xc[:, 1])
-        vol = s.fv.geometry.cell_volume
+        vol = s.fv.to_original(s.fv.geometry.cell_volume)
         hs.append(float(np.sqrt(vol.mean())))
         pe = ex["p"] - np.sum(ex["p"] * vol) / vol.sum()
         ph = f["pressure"] - np.sum(f["pressure"] * vol) / vol.sum()

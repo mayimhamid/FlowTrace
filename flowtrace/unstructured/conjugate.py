@@ -23,7 +23,7 @@ from ..hardware.backend import get_backend
 from ..mesh.unstructured import UnstructuredMesh, extract_cells
 from .case import BoundarySpec, UnstructuredCase
 from .fvmesh import FVMesh
-from .simple import T_FIXED, T_FLUX, SimpleSolver
+from .simple import _THERMAL_WALL, T_FIXED, T_FLUX, SimpleSolver, wall_film
 
 
 class _EnergyOps:
@@ -84,7 +84,8 @@ class ConjugateSolver:
             m = mesh.cell_zone == zid
             gam[m] = float(spec["conductivity"]) / case.cp
             q[m] = float(spec.get("source", 0.0)) / case.cp
-        self.gam_cell = gam
+        self.gam_cell = xp.asarray(gam, dtype=self.dtype)
+        self._internal_cell_map = xp.asarray(self.flow.fv.to_internal(self.cell_map))
         self.q_cell = xp.asarray(q * fv.geometry.cell_volume, dtype=self.dtype)
         # map sub-mesh faces to full-mesh interior/boundary positions
         pos_if = -np.ones(mesh.n_faces, dtype=np.int64)
@@ -101,6 +102,7 @@ class ConjugateSolver:
         self._bf_dst = pos_bf[full_of_sub[bsub[keep]]]
         self._build_thermal_bcs()
         self.ops = _EnergyOps(fv, xp, case)
+        self.ops._device_krylov = self.flow._device_krylov
         self.T = xp.full(self.nc, case.init_T, dtype=self.dtype)
         self._gT = None
         self.setup_seconds = time.perf_counter() - t0
@@ -116,6 +118,7 @@ class ConjugateSolver:
         n = fv.n_bf
         tk = np.zeros(n, dtype=np.int64)
         tv = np.zeros(n)
+        film = np.zeros(n)
         out = np.zeros(n, dtype=bool)
         self.zone_specs = {}
         for z in self.mesh.boundary_zones():
@@ -123,13 +126,17 @@ class ConjugateSolver:
             self.zone_specs[z.name] = spec
             m = fv.bzone == z.id
             if spec.kind == "wall":
-                tk[m] = {"adiabatic": 0, "temperature": T_FIXED, "flux": T_FLUX}[spec.thermal]
+                tk[m] = _THERMAL_WALL[spec.thermal]
+                if spec.thermal == "convection":
+                    film[m] = spec.heat_transfer_coefficient
             elif spec.kind in ("inlet", "pressure"):
                 tk[m] = T_FIXED
             out[m] = spec.kind == "outlet"
             tv[m] = spec.value
         self.tkind = xp.asarray(tk)
         self.tval = xp.asarray(tv, dtype=self.dtype)
+        self.has_film = bool(np.any(film))
+        self.film = xp.asarray(film, dtype=self.dtype) * fv.Sb_mag / self.case.cp if self.has_film else None
         self.is_outlet = xp.asarray(out)
         self.tkind_h, self.tval_h = tk, tv
 
@@ -145,14 +152,12 @@ class ConjugateSolver:
 
     def _face_gamma(self):
         """Harmonic interpolation of cell diffusivities (+ turbulent part in the fluid)."""
-        xp, fv = self.xp, self.fv
-        g = self.gam_cell.copy()
+        fv = self.fv
+        gd = self.gam_cell
         turb = self.flow.turb
         if turb is not None:
-            from .turbulence import PR_T
-
-            g[self.cell_map] += self.be.to_numpy(turb.mut).astype(np.float64) / PR_T
-        gd = xp.asarray(g, dtype=self.dtype)
+            gd = gd.copy()
+            gd[self._internal_cell_map] += turb.mut / self.case.prandtl_turbulent
         gP, gN = gd[fv.P], gd[fv.N]
         w = fv.w  # owner interpolation weight: the owner side holds (1 - w) of d
         gf = 1.0 / ((1.0 - w) / gP + w / gN)
@@ -169,12 +174,18 @@ class ConjugateSolver:
         flux = self.tkind == T_FLUX
         Tb = xp.where(fixed, self.tval, TP)
         Tb = xp.where(self.is_outlet & (ops.Fb < 0), self.tval, Tb)
+        gam = self._face_gamma()
+        if self.has_film:
+            fraction, conductance = wall_film(xp, gam[1], fv.alpha_b, self.film)
+            Tb = Tb + fraction * (self.tval - TP)
         gT = fv.gradient(T, Tb)
         self._gT = gT
-        gam = self._face_gamma()
         q_in = fv.Cb_d @ (flux * self.tval * fv.Sb_mag / self.case.cp) + self.q_cell
         diag, aPN, aNP, Db = ops._coefficients(gam, fixed.astype(self.dtype))
         rhs = ops._rhs(gam, T, gT, Tb, Db, q_in)
+        if self.has_film:
+            diag = diag + fv.Cb_d @ conductance
+            rhs = rhs + fv.Cb_d @ (conductance * (self.tval - (TP - T[fv.Pb])))
         A = fv.matrix(diag, aPN, aNP)
         r = ops._residual(A, diag, T, rhs)
         aT = self.case.relax_T
@@ -182,7 +193,7 @@ class ConjugateSolver:
         Ar = fv.matrix(dr, aPN, aNP)
         b = rhs + ((1.0 - aT) / aT) * diag * T
         self.T, _ = ops._solve(Ar, b, T, dr, tol=1e-4, maxiter=200)
-        self.flow.T = self.T[xp.asarray(self.cell_map)]
+        self.flow.T = self.T[self._internal_cell_map]
         return r
 
     # ------------------------------------------------------------------ solver API
@@ -266,8 +277,14 @@ class ConjugateSolver:
         Tb = np.where(tk == T_FIXED, tv, TP)
         Tb = np.where(out_m & (Fb < 0), tv, Tb)
         alpha_b = h(fv.alpha_b).astype(np.float64)
-        g = self.gam_cell[Pb] * c.cp
+        g = h(self.gam_cell)[Pb] * c.cp
         cond = g * alpha_b * (Tb - TP) * (tk == T_FIXED) + np.where(tk == T_FLUX, tv * h(fv.Sb_mag), 0.0)
+        if self.has_film:
+            _, conductance = wall_film(np, g, alpha_b, c.cp * h(self.film))
+            Tp_film = TP
+            if self._gT is not None:
+                Tp_film = Tp_film + np.sum(h(self._gT)[Pb] * h(fv.db_t), axis=1)
+            cond = cond + conductance * (tv - Tp_film)
         q = cond - c.cp * Fb * Tb
         res = {z.name: float(q[fv.bzone == z.id].sum()) for z in self.mesh.boundary_zones()}
         # interface conduction

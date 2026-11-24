@@ -68,7 +68,7 @@ class FVKernels:
 
         self.cp, self.fv = cp, fv
         self.f = {n: _module.get_function(n) for n in ("ft_face_interp", "ft_ls_gradient", "ft_gg_gradient",
-                                                       "ft_assemble", "ft_dot2", "ft_bicg_p", "ft_bicg_s",
+                                                       "ft_assemble", "ft_transport_rhs", "ft_dot2", "ft_bicg_p", "ft_bicg_s",
                                                        "ft_bicg_x")}
         i32 = lambda a: cp.asarray(np.ascontiguousarray(a, dtype=np.int32))  # noqa: E731
         f64 = lambda a: cp.ascontiguousarray(cp.asarray(a, dtype=cp.float64))  # noqa: E731
@@ -113,6 +113,21 @@ class FVKernels:
                                  (np.int64(fv.nc), np.int64(fv.dim), self.iptr, self.iidx, self.isgn, self.bptr,
                                   self.bidx, self.P, self.N, self.w, self.S, self.Sb, self.vol, self.dxm, phi, phib, g,
                                   np.int32(grad is not None), out))
+        return out
+
+    def transport_rhs(self, gamma, phi, grad, phib, Db, F, Fb, extra, order, limiter=None):
+        cp, fv = self.cp, self.fv
+        f64 = lambda x: cp.ascontiguousarray(x, dtype=cp.float64)
+        variable = getattr(gamma, "ndim", 0) != 0
+        out = cp.empty(fv.nc, dtype=cp.float64)
+        self.f["ft_transport_rhs"](
+            (_blocks(fv.nc),), (THREADS,),
+            (np.int64(fv.nc), np.int64(fv.dim), self.iptr, self.iidx, self.isgn, self.bptr, self.bidx,
+             self.P, self.N, self.w, fv.Tvec, fv.dP_f, fv.dN_f, f64(F), f64(Fb),
+             f64(gamma) if variable else self.w, np.float64(0 if variable else gamma), np.int32(variable),
+             f64(phi), f64(grad), f64(phib), f64(Db), f64(limiter) if limiter is not None else self.w, np.int32(order),
+             f64(extra) if extra is not None else self.w, np.int32(extra is not None), out),
+        )
         return out
 
     def matrix(self, diag, aPN, aNP):

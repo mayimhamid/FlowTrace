@@ -212,3 +212,45 @@ def test_cuda_hllc_kernel_matches_array_path():
     ref = s._hllc(WL, WR, n) * A[:, None]
     got = cp.asnumpy(cuda.hllc_flux(cp.asarray(WL), cp.asarray(WR), cp.asarray(n), cp.asarray(A), 1.4))
     assert np.allclose(got, ref, rtol=1e-11, atol=1e-9 * np.abs(ref).max())
+
+
+@pytest.mark.parametrize("turbulence", ["k-omega-sst", "k-epsilon-realizable"])
+def test_gpu_turbulence_assembly_has_no_host_field_transfers(turbulence, monkeypatch):
+    from flowtrace.mesh.unstructured import cartesian_mesh_2d
+    from flowtrace.unstructured.case import BoundarySpec, UnstructuredCase
+    from flowtrace.unstructured.simple import SimpleSolver
+
+    case = UnstructuredCase(turbulence=turbulence, cell_order="rcm", lanes="off", relax_p=0.5,
+                            scheme="venkatakrishnan", precision="mixed",
+                            boundaries={"top": BoundarySpec("wall", velocity=[1.0, 0.0])})
+    solver = SimpleSolver(cartesian_mesh_2d(8, 8), case, backend=GPU)
+
+    def unexpected_transfer(*args, **kwargs):
+        raise AssertionError("host field transfer within solver step")
+
+    with monkeypatch.context() as m:
+        m.setattr(GPU, "to_numpy", unexpected_transfer)
+        for _ in range(3):
+            solver.step()
+    assert np.isfinite(solver.fields()["velocity-magnitude"]).all()
+
+
+def test_radiation_pointer_source_adds_energy_without_host_roundtrip():
+    from flowtrace.mesh.unstructured import cartesian_mesh_2d, extrude_to_3d
+    from flowtrace.unstructured.case import UnstructuredCase
+    from flowtrace.unstructured.simple import SimpleSolver
+
+    case = UnstructuredCase(energy=True, lanes="off", unsteady=True, inner_iterations=20, dt=0.02, t_end=0.02,
+                            cp=2.0, density=1.0, inner_tol=1e-9, init_T=300.0)
+    mesh = extrude_to_3d(cartesian_mesh_2d(3, 3), 2, 1.0)
+    solver = SimpleSolver(mesh, case, backend=GPU)
+    pointers = solver.get_device_pointers()
+    cp = GPU.xp
+    mem = cp.cuda.UnownedMemory(pointers["radiative_source"], solver.nc * solver.dtype.itemsize, solver)
+    source = cp.ndarray((solver.nc,), dtype=solver.dtype, memptr=cp.cuda.MemoryPointer(mem, 0))
+    source.fill(10.0)
+    while not solver.finished:
+        solver.step()
+    assert solver.get_device_pointers() == pointers
+    assert pointers["triangle_count"] == 2 * solver.fv.n_bf
+    np.testing.assert_allclose(solver.fields()["temperature"], 300.1, rtol=0, atol=1e-8)

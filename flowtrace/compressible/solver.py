@@ -157,7 +157,7 @@ class CompressibleSolver:
         self.be = backend if backend is not None else get_backend(case.backend)
         xp = self.xp = self.be.xp
         self.dtype = np.dtype(np.float32 if case.precision == "fp32" else np.float64)
-        self.fv = fv = FVMesh(mesh, self.be, self.dtype)
+        self.fv = fv = FVMesh(mesh, self.be, self.dtype, cell_order=case.cell_order)
         self.dim = dim = mesh.dim
         if case.axisymmetric and dim != 2:
             raise ValueError("axisymmetric cases need a 2-D mesh (x = axis, y = radius)")
@@ -222,7 +222,7 @@ class CompressibleSolver:
         W[:, 0] = np.broadcast_to(np.asarray(rho, dtype=float), (self.nc,))
         W[:, 1:1 + d] = np.broadcast_to(np.asarray(velocity, dtype=float), (self.nc, d))
         W[:, -1] = np.broadcast_to(np.asarray(p, dtype=float), (self.nc,))
-        self.Q = self.cons(xp.asarray(W, dtype=self.dtype))
+        self.Q = self.cons(xp.asarray(self.fv.to_internal(W), dtype=self.dtype))
 
     # ------------------------------------------------------------------ state conversion
     def prim(self, Q, k=None):
@@ -908,10 +908,10 @@ class CompressibleSolver:
             out.update(self.turb.fields())
         if names:
             out = {k: v for k, v in out.items() if k in names}
-        return out
+        return {k: self.fv.to_original(v) for k, v in out.items()}
 
     def cell_centres(self) -> np.ndarray:
-        return self.fv.geometry.cell_centre
+        return self.fv.to_original(self.fv.geometry.cell_centre)
 
     def mass_balance(self) -> dict:
         """Mass flow out of every boundary zone (kg/s per radian in axisymmetric cases)."""
