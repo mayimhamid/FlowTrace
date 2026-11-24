@@ -97,6 +97,8 @@ class CompressibleCase:
     cfl_max: float = 50.0
     cfl_growth: float = 1.1  # per iteration while the residual decreases
     jacobi_sweeps: int = 8
+    low_mach: bool = False  # Weiss-Smith low-Mach preconditioning
+    u_cut_ratio: float = 1e-4
     dt: Optional[float] = None  # transient: fixed time step (None: CFL-based)
     t_end: float = 1.0
     max_iter: int = 20000

@@ -69,7 +69,7 @@ flowtrace solve examples/elbow-mix.msh.txt --auto --units auto --rho 998.2 --mu 
 `--auto` prints one line per decision (Re and the estimated y+ choose the turbulence model, different
 inlet temperatures switch the energy equation on, a skewed mesh gets first-order energy transport so
 that the temperature stays between the boundary values). `--units` is the length unit of the mesh file
-(Fluent: General > Scale). The default, `auto`, reads an extent of 20 or more as millimetres, scales the
+(Fluent: General > Scale). The default, `auto`, reads an extent of 100 or more as millimetres, scales the
 mesh to metres and says so in the log; give `--units m` for a file that really is that large in metres
 (or a non-dimensional mesh).
 The fluid properties and boundary values are never changed.

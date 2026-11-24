@@ -87,6 +87,135 @@ def spalding_uplus(re_y: np.ndarray, iters: int = 30) -> np.ndarray:
     return np.where(re_y > 0, up, 0.0)
 
 
+def spaldings_law_wall_shear(
+    u_tan: np.ndarray,
+    y_wall: np.ndarray,
+    rho: np.ndarray,
+    nu: np.ndarray,
+    kappa: float = 0.41,
+    B: float = 5.2,
+    max_iter: int = 12,
+    tol: float = 1e-13,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Solves Spalding's C-infinity unified law of the wall via vectorized Newton-Raphson.
+    Eliminates buffer-layer switching discontinuities at y+ = 11.225.
+
+    Returns
+    -------
+    tau_w : (n_wall_faces,) ndarray
+        Wall shear stress magnitude.
+    u_tau : (n_wall_faces,) ndarray
+        Friction velocity.
+    y_plus : (n_wall_faces,) ndarray
+        Dimensionless wall distance.
+    """
+    u_mag = np.maximum(np.abs(u_tan), 1e-15)
+    Re_y = (u_mag * y_wall) / np.maximum(nu, 1e-15)
+
+    u_plus = np.minimum(np.sqrt(Re_y), (1.0 / kappa) * np.log1p(kappa * Re_y) + B)
+    u_plus = np.maximum(u_plus, 1e-12)
+
+    exp_neg_kB = np.exp(-kappa * B)
+
+    for _ in range(max_iter):
+        ku = kappa * u_plus
+        exp_ku = np.exp(np.minimum(ku, 50.0))
+        poly = 1.0 + ku + 0.5 * ku**2 + (1.0 / 6.0) * ku**3
+        dpoly = 1.0 + ku + 0.5 * ku**2
+
+        f_spald = u_plus + exp_neg_kB * (exp_ku - poly)
+        df_spald = 1.0 + kappa * exp_neg_kB * (exp_ku - dpoly)
+
+        g = u_plus * f_spald - Re_y
+        dg = f_spald + u_plus * df_spald
+
+        du = g / dg
+        u_plus -= du
+        if np.max(np.abs(du)) < tol:
+            break
+
+    u_tau = u_mag / u_plus
+    y_plus = (y_wall * u_tau) / np.maximum(nu, 1e-15)
+    tau_w = rho * (u_tau**2)
+    return tau_w, u_tau, y_plus
+
+
+def linearize_kepsilon_sources(
+    rho: np.ndarray,
+    nu: np.ndarray,
+    k: np.ndarray,
+    eps: np.ndarray,
+    P_k: np.ndarray,
+    S_mag: np.ndarray,
+    model: str = "realizable",
+    C2: float = 1.9,
+    C1_eps: float = 1.44,
+    C2_eps: float = 1.92,
+    k_min: float = 1e-12,
+    eps_min: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Computes Patankar negative-slope source term linearization (S = S_C + S_P * phi)
+    for Realizable and Standard k-epsilon turbulence models.
+    Guarantees S_C >= 0 and S_P <= 0 everywhere for M-matrix positivity preservation.
+    """
+    k_safe = np.maximum(k, k_min)
+    eps_safe = np.maximum(eps, eps_min)
+    P_k_safe = np.maximum(P_k, 0.0)
+
+    Sc_k = P_k_safe
+    Sp_k = -(rho * eps_safe) / k_safe
+
+    if model.lower() == "realizable":
+        eta = (S_mag * k_safe) / eps_safe
+        C1 = np.maximum(0.43, eta / (eta + 5.0))
+        prod_eps = rho * C1 * S_mag * eps_safe
+
+        sqrt_nu_eps = np.sqrt(np.maximum(nu * eps_safe, 0.0))
+        denom = k_safe + sqrt_nu_eps
+        denom_sq = denom**2
+
+        Sp_eps = -rho * C2 * (eps_safe * (2.0 * k_safe + 1.5 * sqrt_nu_eps)) / denom_sq
+        Sc_dest = rho * C2 * ((eps_safe**2) * (k_safe + 0.5 * sqrt_nu_eps)) / denom_sq
+        Sc_eps = prod_eps + Sc_dest
+
+    elif model.lower() == "standard":
+        eps_over_k = eps_safe / k_safe
+        prod_eps = C1_eps * eps_over_k * P_k_safe
+        Sp_eps = -2.0 * rho * C2_eps * eps_over_k
+        Sc_dest = rho * C2_eps * (eps_safe**2) / k_safe
+        Sc_eps = prod_eps + Sc_dest
+    else:
+        raise ValueError(f"Unsupported k-epsilon model variant: {model}")
+
+    return Sc_k, Sp_k, Sc_eps, Sp_eps
+
+
+def assemble_and_relax_scalar_system(
+    A_diag: np.ndarray,
+    A_offdiag_sum: np.ndarray,
+    rhs: np.ndarray,
+    phi_old: np.ndarray,
+    Sc: np.ndarray,
+    Sp: np.ndarray,
+    volume: np.ndarray,
+    alpha: float = 0.8,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Injects linearized source terms into the FVM matrix diagonal and RHS,
+    then applies Patankar implicit under-relaxation.
+    """
+    A_P = A_diag - Sp * volume
+    b_P = rhs + Sc * volume
+    A_P = np.maximum(A_P, A_offdiag_sum + 1e-15)
+
+    inv_alpha = 1.0 / alpha
+    A_P_relaxed = A_P * inv_alpha
+    b_P_relaxed = b_P + ((1.0 - alpha) * inv_alpha) * A_P * phi_old
+    return A_P_relaxed, b_P_relaxed
+
+
 def spalding_utau(xp, ut, y, nu) -> np.ndarray:
     """Friction velocity from Spalding's law for wall-parallel speed ``ut`` at distance ``y``."""
     ut_h = np.asarray(ut if xp is np else xp.asnumpy(ut), dtype=float)
@@ -460,11 +589,17 @@ class KEpsilonRealizable(TurbulenceModel):
         return 1.0 / (self.A0 + As * self.k * Ustar / self.w), S
 
     def _eps_sources(self, S, k, eps, Gk):
-        """Realizable epsilon equation: production rho C1 S eps, destruction rho C2 eps^2/(k + sqrt(nu eps))."""
+        """Realizable epsilon equation: production rho C1 S eps, destruction with Patankar negative-slope linearization."""
         xp, rho = self.xp, self.rho
-        eta = S * k / eps
+        eta = S * k / xp.maximum(eps, 1e-12)
         C1 = xp.maximum(0.43, eta / (eta + 5.0))
-        return rho * C1 * S * eps, rho * self.C2 * eps / (k + xp.sqrt(self.nu * eps))
+        prod_eps = rho * C1 * S * eps
+        sqrt_nu_eps = xp.sqrt(xp.maximum(self.nu * eps, 0.0))
+        denom = k + sqrt_nu_eps
+        denom_sq = denom ** 2
+        Sp_eps = rho * self.C2 * (eps * (2.0 * k + 1.5 * sqrt_nu_eps)) / denom_sq
+        Sc_dest = rho * self.C2 * ((eps ** 2) * (k + 0.5 * sqrt_nu_eps)) / denom_sq
+        return prod_eps + Sc_dest, Sp_eps
 
     def _update_mut(self, gU):
         if gU is None:
@@ -534,8 +669,11 @@ class KEpsilonStandard(KEpsilonRealizable):
         return CMU, S
 
     def _eps_sources(self, S, k, eps, Gk):
-        rho = self.rho
-        return self.C1s * eps / k * Gk, rho * self.C2s * eps / k
+        xp, rho = self.xp, self.rho
+        prod_eps = self.C1s * (eps / xp.maximum(k, 1e-12)) * Gk
+        Sp_eps = 2.0 * rho * self.C2s * (eps / xp.maximum(k, 1e-12))
+        Sc_dest = rho * self.C2s * (eps ** 2) / xp.maximum(k, 1e-12)
+        return prod_eps + Sc_dest, Sp_eps
 
 
 def make_turbulence(solver) -> Optional[TurbulenceModel]:

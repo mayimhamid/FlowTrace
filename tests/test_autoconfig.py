@@ -84,3 +84,37 @@ def test_polygonal_2d_cells_run_like_quads():
     while not s.finished:
         s.step()
     assert poly.n_cells == 144 and s.converged
+
+
+SQUARE = os.path.join(os.path.dirname(__file__), "data", "SquareCylinder-Coarse.msh")
+
+
+def test_bluff_body_above_the_shedding_reynolds_number_is_run_in_time():
+    """Domain 80 units long, body side 4: not millimetres. At Re = 400 the wake sheds vortices, so the
+    case is switched to a transient run; at Re = 20 it stays steady."""
+    mesh, _ = read_any_mesh(SQUARE)
+    assert guess_units(mesh)[0] == "m"
+    case = UnstructuredCase(boundaries=default_boundaries(mesh), density=1.0, viscosity=0.01)
+    same, notes, applied = auto_configure(mesh, case)
+    assert same.nodes.max() == mesh.nodes.max() and applied["body_zone"] == "BluffWalls"
+    assert case.unsteady and case.time_scheme == "bdf2" and case.ref_area == pytest.approx(4.0)
+    assert case.dt == pytest.approx(0.025 * 4.0) and case.t_end == pytest.approx(120.0 * 4.0)
+    assert case.max_iter >= round(case.t_end / case.dt) * case.inner_iterations
+    slow = UnstructuredCase(boundaries=default_boundaries(mesh), density=1.0, viscosity=0.2)
+    _, _, applied = auto_configure(mesh, slow)
+    assert not slow.unsteady and applied["body_zone"] == "BluffWalls"
+
+
+def test_body_force_report_finds_the_shedding_frequency():
+    from flowtrace.runtime.engine import EventHub, Job
+
+    job = Job({"kind": "unstructured"}, EventHub(), ".")
+    case = UnstructuredCase(ref_velocity=2.0, ref_area=0.5)
+    t = np.arange(0.0, 40.0, 0.01)
+    f = 0.15 * 2.0 / 0.5  # Strouhal 0.15
+    log = {"t": t, "cd": 1.8 + 0.02 * np.sin(4 * np.pi * f * t), "cl": 0.4 * np.sin(2 * np.pi * f * t), "zone": "body"}
+    rep = job._body_force_report(log, case)
+    assert rep["shedding"] and rep["strouhal"] == pytest.approx(0.15, rel=0.02)
+    assert rep["cd_mean"] == pytest.approx(1.8, abs=0.005) and rep["cl_amplitude"] == pytest.approx(0.4, rel=0.01)
+    steady = job._body_force_report({"t": t, "cd": 1.5 + 0 * t, "cl": 0 * t, "zone": "body"}, case)
+    assert not steady["shedding"] and any("did not oscillate" in line for line in steady["lines"])

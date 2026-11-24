@@ -93,3 +93,31 @@ Results without Fluent stay **labelled placeholders**. See the [study page](../v
     worse than it is. Compare absolute residuals, or a physical monitor such as drag, Nusselt
     number or mass imbalance. FlowTrace's study counts iterations until the field itself is
     within 10⁻⁴ of the converged solution.
+
+## Running a Fluent case as it was set up
+
+A CFF `.cas.h5` carries the solver settings next to the mesh. With `--auto` (dashboard:
+*Auto-detect solver options*) FlowTrace reads them and chooses the solver the case needs:
+
+| The case says | FlowTrace runs |
+|---|---|
+| fluid density by the ideal-gas law, or a pressure-far-field boundary | the density-based compressible solver, with the case's total pressure and temperature, static pressures, gas constant, cp and viscosity |
+| constant density | the pressure-based SIMPLE/SIMPLEC solver |
+| a 2-D mesh with an `axis` boundary | axisymmetric (x is the axis) |
+| constant density, a body in the stream, Re above about 47 | a transient run (the wake sheds vortices), reporting the mean drag and the Strouhal number |
+
+```bash
+flowtrace solve nozzle.cas.h5 --auto                          # solver and boundary values from the case
+flowtrace solve nozzle.cas.h5 --auto --compare nozzle.dat.h5  # and the difference from Fluent's own solution
+flowtrace solve case.cas.h5 --auto --solver incompressible    # override the choice
+```
+
+What is read: the turbulence model, the fluid's density law, constant cp, viscosity, conductivity and
+molecular weight, and the constant values of pressure inlets, pressure outlets and far fields (gauge
+pressures plus the operating pressure). What is not: profiles, UDFs, wall thermal conditions (walls are
+adiabatic), species, and the legacy text `.cas`. A mesh-only file (`.msh`, `.msh.h5`) has no settings:
+a far-field boundary still selects the compressible solver, with default values and a warning.
+
+A compressible run ends with physical checks instead of a bare "converged": the global mass balance,
+the total temperature at the outflow against the inflow value, the largest total temperature in the
+field, and positivity of density and pressure.

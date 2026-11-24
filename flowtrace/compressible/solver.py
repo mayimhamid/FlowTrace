@@ -57,6 +57,77 @@ def _scatter_min(xp, out, idx, vals):
         cupyx.scatter_min(out, idx, vals)
 
 
+class WeissSmithLowMachPreconditioner:
+    """
+    Weiss-Smith time-derivative preconditioning and preconditioned HLLC
+    Riemann flux for all-speed compressible flows.
+    """
+
+    def __init__(self, gamma: float = 1.4, u_cut_ratio: float = 1e-4):
+        self.gamma = gamma
+        self.gm1 = gamma - 1.0
+        self.u_cut_ratio = u_cut_ratio
+
+    def compute_beta(
+        self,
+        rho: np.ndarray,
+        u_vel: np.ndarray,
+        v_vel: np.ndarray,
+        w_vel: np.ndarray,
+        p: np.ndarray,
+        mu_eff: np.ndarray,
+        dx: np.ndarray,
+        u_ref_global: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Computes local Weiss-Smith preconditioning parameter beta = (U_r / c)^2."""
+        c2 = np.maximum(self.gamma * p / np.maximum(rho, 1e-12), 1e-12)
+        c = np.sqrt(c2)
+
+        vel_mag = np.sqrt(u_vel**2 + v_vel**2 + w_vel**2)
+        u_visc = mu_eff / (np.maximum(rho, 1e-12) * np.maximum(dx, 1e-12))
+        u_cut = self.u_cut_ratio * u_ref_global
+
+        u_r = np.minimum(c, np.maximum(vel_mag, np.maximum(u_visc, u_cut)))
+        beta = (u_r**2) / c2
+        return beta, c
+
+    def precondition_residual(
+        self,
+        U: np.ndarray,
+        residual: np.ndarray,
+        beta: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Applies Gamma_U^{-1} = I - (1 - beta) * q * r^T to the conservative residual.
+        U, residual have shape (n_cells, nvar): [rho, rho*u..., rho*E].
+        """
+        dim = U.shape[1] - 2
+        rho = U[:, 0]
+        inv_rho = 1.0 / np.maximum(rho, 1e-12)
+        u = U[:, 1:1 + dim] * inv_rho[:, None]
+        E = U[:, -1] * inv_rho
+
+        ke = 0.5 * np.sum(u * u, axis=1)
+        p = self.gm1 * rho * (E - ke)
+        c2 = self.gamma * p * inv_rho
+        H = E + p * inv_rho
+
+        coeff = self.gm1 / np.maximum(c2, 1e-12)
+        r_dot_res = coeff * (
+            ke * residual[:, 0]
+            - np.sum(u * residual[:, 1:1 + dim], axis=1)
+            + residual[:, -1]
+        )
+
+        factor = (1.0 - beta) * r_dot_res
+        prec_res = residual.copy()
+        prec_res[:, 0] -= factor
+        for d in range(dim):
+            prec_res[:, 1 + d] -= factor * u[:, d]
+        prec_res[:, -1] -= factor * H
+        return prec_res
+
+
 class CompressibleSolver:
     def __init__(self, mesh: UnstructuredMesh, case: CompressibleCase, backend=None):
         t0 = time.perf_counter()
@@ -91,6 +162,9 @@ class CompressibleSolver:
         self.d_len = xp.sqrt(xp.sum(fv.d * fv.d, axis=1))
         self.db_len = xp.maximum(xp.abs(xp.sum(fv.db * self.n_b, axis=1)), 1e-300)
         self._build_boundaries()
+        self.low_mach = getattr(case, "low_mach", False)
+        self.u_cut_ratio = getattr(case, "u_cut_ratio", 1e-4)
+        self.preconditioner = WeissSmithLowMachPreconditioner(self.gamma, self.u_cut_ratio)
         self.flux_kernel = self._pick_flux_kernel()
         # initial field
         u0 = (list(case.init_velocity) + [0.0] * 3)[:dim]
@@ -210,12 +284,27 @@ class CompressibleSolver:
         p_o = xp.where(sup, p, self.bc_p)
         r_o = xp.where(un < 0, p_o / (R * self.bc_T), rho * (p_o / p) ** (1.0 / g))  # isentropic to p_out
         out = put(code == P_OUT, r_o, u, p_o)
-        # pressure inlet: total conditions, static pressure from the interior (subsonic)
-        p_in = xp.minimum(p, self.bc_p0 * (1.0 - 1e-9))
-        M2 = 2.0 / (g - 1.0) * ((self.bc_p0 / p_in) ** ((g - 1.0) / g) - 1.0)
-        sup_in = M2 >= 1.0
-        p_in = xp.where(sup_in, xp.minimum(self.bc_p, self.bc_p0 * (1.0 - 1e-9)), p_in)
-        M2 = 2.0 / (g - 1.0) * ((self.bc_p0 / p_in) ** ((g - 1.0) / g) - 1.0)
+        # pressure inlet (subsonic): total enthalpy and entropy of the reservoir come in, the Riemann
+        # invariant J = q - 2c/(gamma-1) of the wave running upstream comes out of the interior
+        # (q: speed into the domain along the inward normal). Eliminating q from
+        # c0^2 = c^2 + (gamma-1)/2 q^2 gives a quadratic for the boundary speed of sound. Taking the
+        # static pressure of the interior cell instead (the earlier form) is not a characteristic
+        # condition: it switched between a subsonic and a "supersonic" branch from one iteration to
+        # the next and left the inlet mass flow in a period-2 cycle that never met the outlet's.
+        c0sq = g * R * self.bc_T0
+        J = -un - 2.0 * c / (g - 1.0)
+        qa = (g + 1.0) / (g - 1.0)
+        disc = xp.maximum(4.0 * J * J - 4.0 * qa * (0.5 * (g - 1.0) * J * J - c0sq), 0.0)
+        c_in = (-2.0 * J + xp.sqrt(disc)) / (2.0 * qa)
+        # between stagnation (q = 0, c = c0) and sonic inflow; a supersonic inlet takes the given static p
+        c_sonic = xp.sqrt(2.0 * c0sq / (g + 1.0))
+        c_in = xp.clip(c_in, c_sonic, xp.sqrt(c0sq))
+        T_in = c_in * c_in / (g * R)
+        p_in = self.bc_p0 * (T_in / self.bc_T0) ** (g / (g - 1.0))
+        M2 = 2.0 / (g - 1.0) * (self.bc_T0 / T_in - 1.0)
+        sup_in = (c_in <= c_sonic) & (self.bc_p < p_in)
+        p_in = xp.where(sup_in, self.bc_p, p_in)
+        M2 = xp.where(sup_in, 2.0 / (g - 1.0) * ((self.bc_p0 / p_in) ** ((g - 1.0) / g) - 1.0), M2)
         T_in = self.bc_T0 / (1.0 + 0.5 * (g - 1.0) * M2)
         vmag = xp.sqrt(xp.maximum(M2, 0.0) * g * R * T_in)
         out = put(code == P_IN, p_in / (R * T_in), vmag[:, None] * self.bc_dir, p_in)
@@ -270,8 +359,27 @@ class CompressibleSolver:
         H_roe = w * (EL + pL) / rL + (1.0 - w) * (ER + pR) / rR
         c_roe = xp.sqrt(xp.maximum((g - 1.0) * (H_roe - 0.5 * xp.sum(u_roe * u_roe, axis=1)), 1e-30))
         un_roe = xp.sum(u_roe * n, axis=1)
-        SL = xp.minimum(unL - cL, un_roe - c_roe)
-        SR = xp.maximum(unR + cR, un_roe + c_roe)
+        if self.low_mach:
+            velL = xp.sqrt(xp.sum(uL * uL, axis=1))
+            velR = xp.sqrt(xp.sum(uR * uR, axis=1))
+            beta_L = xp.clip((velL / xp.maximum(cL, 1e-12))**2, 1e-4, 1.0)
+            beta_R = xp.clip((velR / xp.maximum(cR, 1e-12))**2, 1e-4, 1.0)
+            beta_roe = xp.maximum(beta_L, beta_R)
+
+            unL_p = 0.5 * (1.0 + beta_L) * unL
+            cL_p = 0.5 * xp.sqrt(((1.0 - beta_L) * unL) ** 2 + 4.0 * beta_L * cL**2)
+
+            unR_p = 0.5 * (1.0 + beta_R) * unR
+            cR_p = 0.5 * xp.sqrt(((1.0 - beta_R) * unR) ** 2 + 4.0 * beta_R * cR**2)
+
+            un_roe_p = 0.5 * (1.0 + beta_roe) * un_roe
+            c_roe_p = 0.5 * xp.sqrt(((1.0 - beta_roe) * un_roe) ** 2 + 4.0 * beta_roe * c_roe**2)
+
+            SL = xp.minimum(unL_p - cL_p, un_roe_p - c_roe_p)
+            SR = xp.maximum(unR_p + cR_p, un_roe_p + c_roe_p)
+        else:
+            SL = xp.minimum(unL - cL, un_roe - c_roe)
+            SR = xp.maximum(unR + cR, un_roe + c_roe)
         den = rL * (SL - unL) - rR * (SR - unR)
         SM = (pR - pL + rL * unL * (SL - unL) - rR * unR * (SR - unR)) / xp.where(den == 0, 1e-300, den)
         FL = self._euler_flux(WL, n)
@@ -292,6 +400,8 @@ class CompressibleSolver:
 
     def _pick_flux_kernel(self) -> str:
         """native C++/OpenMP (NumPy, FP64), CUDA (CuPy, FP64) or the vectorised array code."""
+        if getattr(self, "low_mach", False):
+            return "array"
         if self.dtype != np.float64:
             return "array"
         from .. import native
@@ -361,15 +471,33 @@ class CompressibleSolver:
         if self.case.order == 2 or self.case.viscous:
             grad = self._gradients(W, Wface_b)
         if self.case.order == 2:
-            phi = self._limiter(W, Wface_b, grad) if self.case.limiter != "none" else xp.ones_like(W)
-            WL = W[P] + phi[P] * xp.einsum("fkd,fd->fk", grad[P], fv.dP_f)
-            WR = W[N] + phi[N] * xp.einsum("fkd,fd->fk", grad[N], fv.dN_f)
-            WbL = WP_b + phi[Pb] * xp.einsum("fkd,fd->fk", grad[Pb], fv.db)
-            bad = (WL[:, 0] <= 0) | (WL[:, -1] <= 0) | (WR[:, 0] <= 0) | (WR[:, -1] <= 0)
+            # Reconstruct and limit (T, u, p), not (rho, u, p). Limiting rho and p separately bounds
+            # each of them by its neighbours but not their ratio: across a strong expansion a face
+            # could take p near the largest and rho near the smallest neighbour value, a temperature
+            # far above any cell's. Wall cells before a sharp nozzle throat settled 60 % above the
+            # reservoir temperature that way. With T limited itself, the face enthalpy stays within
+            # the neighbours' range.
+            Rg = self.R
+            V = W.copy()
+            V[:, 0] = W[:, -1] / (W[:, 0] * Rg)
+            Vb = Wface_b.copy()
+            Vb[:, 0] = Wface_b[:, -1] / (Wface_b[:, 0] * Rg)
+            gV = grad.copy()
+            gV[:, 0, :] = (grad[:, -1, :] - (Rg * V[:, 0])[:, None] * grad[:, 0, :]) / (W[:, 0] * Rg)[:, None]
+            phi = self._limiter(V, Vb, gV) if self.case.limiter != "none" else xp.ones_like(W)
+
+            def to_w(X, fallback):
+                bad = (X[:, 0] <= 0) | (X[:, -1] <= 0)
+                out = X.copy()
+                out[:, 0] = X[:, -1] / (Rg * xp.where(bad, 1.0, X[:, 0]))
+                return xp.where(bad[:, None], fallback, out), bad
+
+            WL, badL = to_w(V[P] + phi[P] * xp.einsum("fkd,fd->fk", gV[P], fv.dP_f), W[P])
+            WR, badR = to_w(V[N] + phi[N] * xp.einsum("fkd,fd->fk", gV[N], fv.dN_f), W[N])
+            bad = badL | badR  # one side unusable: both sides fall back to their cell values
             WL = xp.where(bad[:, None], W[P], WL)
             WR = xp.where(bad[:, None], W[N], WR)
-            badb = (WbL[:, 0] <= 0) | (WbL[:, -1] <= 0)
-            WbL = xp.where(badb[:, None], WP_b, WbL)
+            WbL, _ = to_w(V[Pb] + phi[Pb] * xp.einsum("fkd,fd->fk", gV[Pb], fv.db), WP_b)
             Wgb = self._ghost(WbL)
         else:
             WL, WR, WbL, Wgb = W[P], W[N], WP_b, Wg
@@ -459,8 +587,14 @@ class CompressibleSolver:
         c = xp.sqrt(g * W[:, -1] / W[:, 0])
         un_P = xp.abs(xp.sum(W[P, 1:1 + d] * self.n_i, axis=1))
         un_N = xp.abs(xp.sum(W[N, 1:1 + d] * self.n_i, axis=1))
-        lam = xp.maximum(un_P + c[P], un_N + c[N]) * self.A_i
-        lamb = (xp.abs(xp.sum(W[Pb, 1:1 + d] * self.n_b, axis=1)) + c[Pb]) * self.A_b
+        if self.low_mach:
+            vel = xp.sqrt(xp.sum(W[:, 1:1 + d] ** 2, axis=1))
+            beta = xp.clip((vel / xp.maximum(c, 1e-12))**2, 1e-4, 1.0)
+            eff_c = 0.5 * xp.sqrt(((1.0 - beta) * vel) ** 2 + 4.0 * beta * c**2)
+        else:
+            eff_c = c
+        lam = xp.maximum(un_P + eff_c[P], un_N + eff_c[N]) * self.A_i
+        lamb = (xp.abs(xp.sum(W[Pb, 1:1 + d] * self.n_b, axis=1)) + eff_c[Pb]) * self.A_b
         if self.case.viscous:
             T = W[:, -1] / (W[:, 0] * self.R)
             mu = self._viscosity(T) + (self.turb.mut if self.turb is not None else 0.0)
@@ -554,6 +688,21 @@ class CompressibleSolver:
         self._prev_rmax = rmax
         dt, lam, lamb, Lc = self._local_dt(W, self.cfl)
         D = self.V / dt + 0.5 * Lc
+        axi = c.axisymmetric
+        if axi:
+            # The radius-weighted face areas of a cell do not sum to zero: sum_f n_y A_f = planar area.
+            # The cell's own state therefore enters its residual through 0.5 F_y(Q) and through the
+            # pressure source, both times the planar area. Left out of the implicit operator (as for a
+            # planar cell, where they cancel) the update diverged above CFL ~ 10; they are carried in
+            # the sweeps below, and the diagonal is raised by their spectral bound.
+            xp = self.xp
+            ey = xp.zeros((1, self.dim), dtype=self.dtype)
+            ey[0, 1] = 1.0
+            vp = self.vol_planar[:, None]
+            FY0 = self._euler_flux(W, ey)
+            p0c = W[:, -1]
+            cs = xp.sqrt(self.gamma * W[:, -1] / W[:, 0])
+            D = D + (xp.sqrt(xp.sum(W[:, 1:1 + self.dim] ** 2, axis=1)) + cs) * self.vol_planar
         dQ = -R / D[:, None]
         n = self.n_i
         A = self.A_i[:, None]
@@ -568,7 +717,13 @@ class CompressibleSolver:
             dFP = self._euler_flux(WPn, n) - FP0
             offP = 0.5 * (dFN * A - lamA * dQN)  # neighbour N in P's row (normal out of P)
             offN = 0.5 * (-dFP * A - lamA * dQP)  # neighbour P in N's row (normal out of N is -n)
-            dQ = (-R - fv.Cown_d @ offP - fv.Cnei_d @ offN) / D[:, None]
+            rhs = -R - fv.Cown_d @ offP - fv.Cnei_d @ offN
+            if axi:
+                Wn = self.prim(Q + dQ)
+                own = 0.5 * (self._euler_flux(Wn, ey) - FY0) * vp
+                own[:, 2] -= (Wn[:, -1] - p0c) * self.vol_planar
+                rhs = rhs - own
+            dQ = rhs / D[:, None]
         self.Q = Q + self._positive(Q, dQ)
 
     def _record(self, R) -> float:

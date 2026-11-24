@@ -254,6 +254,7 @@ async function renderMeshInfo(info) {
       (warn || ` · <span style="color:var(--ok)">${esc(t("qualityOk"))}</span>`);
   }
   updateUnitNote();
+  renderFluentSetup(info);
   renderZoneTable(info);
   $("#zoneCard").classList.remove("hidden");
   const solids = info.solid_zones || [];
@@ -390,6 +391,34 @@ function bindMesh3DControls() {
     const r = cv.getBoundingClientRect(), z = Math.floor((e.clientY - r.top - 8) / 16);
     if (e.clientX - r.left < 220 && z >= 0 && z < g.names.length) { g.hidden = g.hidden || new Set(); g.hidden.has(z) ? g.hidden.delete(z) : g.hidden.add(z); draw(); }
   });
+}
+/* What the file itself says about the physics, and which solver that needs. A compressible case is
+   run with the values of the Fluent case; the incompressible inputs below do not apply to it. */
+function renderFluentSetup(info) {
+  const el = $("#setupNote"), fs = info.fluent_setup;
+  const comp = !!fs && fs.solver === "compressible";
+  S.compressible = comp;
+  ["#zoneCard", "#propsCard"].forEach((id) => $(id).classList.toggle("hidden", comp));
+  if (!fs || (!comp && !fs.has_settings)) { el.classList.add("hidden"); return; }
+  const kPa = (v) => `${+(v / 1000).toPrecision(4)} kPa`;
+  let html = comp ? `<b>Compressible flow</b> — solved with the density-based solver (${esc(fs.reasons.join("; "))}).`
+    : "<b>Incompressible flow</b> — constant density in the Fluent case; solved with the pressure-based solver.";
+  if (fs.has_settings) {
+    const m = fs.models || {}, mat = fs.material || {};
+    html += `<br>From the Fluent case: ${esc(m.turbulence || "laminar")}${mat.name ? `, ${esc(mat.name)}` : ""}.`;
+    const rows = Object.entries(fs.zones || {}).map(([n, z]) => {
+      const v = [];
+      if (z.type === "pressure-inlet") { if (z.p0 !== undefined) v.push(`p0 ${kPa(z.p0)}`); if (z.T0 !== undefined) v.push(`T0 ${z.T0} K`); }
+      else if (z.type === "pressure-outlet") { if (z.p !== undefined) v.push(`p ${kPa(z.p)}`); }
+      else if (z.type === "pressure-far-field") { if (z.mach !== undefined) v.push(`Mach ${z.mach}`); if (z.p !== undefined) v.push(`p ${kPa(z.p)}`); if (z.T !== undefined) v.push(`T ${z.T} K`); }
+      else if (z.type === "velocity-inlet" && z.speed !== undefined) v.push(`${z.speed} m/s`);
+      return `<li><b>${esc(n)}</b> <span class="muted">${esc(z.type)}</span> ${esc(v.join(", "))}</li>`;
+    }).join("");
+    if (comp && rows) html += `<ul style="margin:4px 0 0; padding-inline-start:18px">${rows}</ul>`;
+  } else if (comp) {
+    html += `<br><span style="color:var(--warn)">This file has no case settings (mesh only): boundary values default to 101325 Pa, 300 K, Mach 0. Load the .cas.h5 for the real ones.</span>`;
+  }
+  el.innerHTML = html; el.classList.remove("hidden");
 }
 const UNIT_M = { m: 1, cm: 0.01, mm: 0.001, in: 0.0254 };
 const fmtLen = (v) => (v >= 1 ? `${+v.toPrecision(3)} m` : v >= 0.01 ? `${+(v * 100).toPrecision(3)} cm` : `${+(v * 1000).toPrecision(3)} mm`);
@@ -698,6 +727,15 @@ function renderResult(res) {
   }
   if (res.continuity_local_max !== undefined) {
     $("#validation").insertAdjacentHTML("beforeend", `<div class="check"><span class="muted">Local continuity (max cell imbalance / mean face flux)</span><span class="val">${Number(res.continuity_local_max).toExponential(2)}</span></div>`);
+  }
+  const uf = res.unsteady_forces;
+  if (uf) {
+    $("#validation").insertAdjacentHTML("beforeend", `<div data-group="1" style="margin-top:8px"><b>Unsteady forces on ${esc(uf.zone)}</b></div>` +
+      `<div class="check"><span>Mean drag coefficient</span><span class="val">${fmt(uf.cd_mean, 4)}</span></div>` +
+      `<div class="check"><span>Lift amplitude</span><span class="val">${fmt(uf.cl_amplitude, 3)}</span></div>` +
+      (uf.shedding ? `<div class="check"><span>Strouhal number f L / U</span><span class="val">${fmt(uf.strouhal, 4)}</span></div>`
+        : `<div class="desc">The lift did not oscillate in the averaging window: shedding has not set in yet (run longer) or the flow is steady.</div>`) +
+      `<div class="desc">Averaged over t = ${fmt(uf.window[0], 4)} to ${fmt(uf.window[1], 4)} s.</div>`);
   }
   const cert = res.certificate;
   if (cert && cert.quantities) {

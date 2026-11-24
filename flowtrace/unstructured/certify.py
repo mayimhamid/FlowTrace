@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import math
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -32,6 +33,86 @@ from ..mesh.refine import refine_2d
 
 FS_TWO, FS_THREE = 3.0, 1.25
 P_MIN = 0.5
+
+
+@dataclass
+class GCIReport:
+    observed_order: float
+    extrapolated_value: float
+    gci_fine_pct: float
+    gci_medium_pct: float
+    asymptotic_ratio: float
+    convergence_regime: str
+
+
+def compute_gci_certificate(
+    f1: float,
+    f2: float,
+    f3: float,
+    r21: float,
+    r32: float,
+    formal_order: float = 2.0,
+    Fs: float = 1.25,
+) -> GCIReport:
+    """
+    Computes Roache's Grid Convergence Index (GCI) and Richardson extrapolation
+    for three systematically refined grids (h1 < h2 < h3) using fixed-point
+    iteration for non-constant refinement ratios.
+    """
+    eps32 = f3 - f2
+    eps21 = f2 - f1
+
+    if abs(eps21) < 1e-15:
+        return GCIReport(
+            observed_order=formal_order,
+            extrapolated_value=f1,
+            gci_fine_pct=0.0,
+            gci_medium_pct=0.0,
+            asymptotic_ratio=1.0,
+            convergence_regime="EXACT_CONVERGED",
+        )
+
+    ratio = eps32 / eps21
+    s = 1.0 if ratio > 0.0 else -1.0
+
+    # Fixed-point iteration for observed order p
+    p = formal_order
+    ln_r21 = np.log(r21)
+    abs_ratio = abs(ratio)
+
+    for _ in range(100):
+        q_p = np.log((r21**p - s) / (r32**p - s))
+        p_new = abs(np.log(abs_ratio) + q_p) / ln_r21
+        if abs(p_new - p) < 1e-10:
+            p = p_new
+            break
+        p = 0.5 * (p + p_new)
+
+    f_ext_21 = (r21**p * f1 - f2) / (r21**p - 1.0)
+    ea_21 = abs((f1 - f2) / max(abs(f1), 1e-15))
+    ea_32 = abs((f2 - f3) / max(abs(f2), 1e-15))
+
+    gci_21 = (Fs * ea_21) / (r21**p - 1.0)
+    gci_32 = (Fs * ea_32) / (r32**p - 1.0)
+
+    # Asymptotic range check: |eps32| / (r21^p * |eps21|) should approach 1.0
+    asymptotic_ratio = abs(eps32) / max((r21**p) * abs(eps21), 1e-15)
+
+    if s < 0:
+        regime = "OSCILLATORY"
+    elif 0.85 <= asymptotic_ratio <= 1.15 and p >= 0.5 * formal_order:
+        regime = "ASYMPTOTIC_MONOTONIC"
+    else:
+        regime = "PRE_ASYMPTOTIC"
+
+    return GCIReport(
+        observed_order=float(p),
+        extrapolated_value=float(f_ext_21),
+        gci_fine_pct=float(gci_21 * 100.0),
+        gci_medium_pct=float(gci_32 * 100.0),
+        asymptotic_ratio=float(asymptotic_ratio),
+        convergence_regime=regime,
+    )
 
 
 def functionals(solver) -> Dict[str, float]:

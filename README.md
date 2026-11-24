@@ -38,6 +38,12 @@ this repository.
   a map of where the mesh is too coarse. Quantities that do not converge with the mesh (singular
   corners) are flagged instead of being given a small band. Steady 2-D cases
   ([how it works and what it does not do](docs/theory/certificate.md)).
+* **Rigorous Mathematical Foundations & Advanced Numerics:**
+  * **Non-orthogonal pressure corrector loop:** Deferred correction for collocated unstructured SIMPLE/SIMPLEC, recovering strict discrete mass conservation without rebuilding the AMG hierarchy on heavily skewed meshes ($\theta > 60^\circ$).
+  * **Directional line-implicit preconditioning:** Hybrid Thomas-algorithm block preconditioning for high-aspect-ratio boundary layers ($AR > 1000$), eliminating Krylov stall on both CPU (Numba) and GPU (CUDA).
+  * **Weiss-Smith low-Mach preconditioning:** Extends the density-based compressible solver to all-speed regimes ($Ma \to 0$), removing acoustic stiffness and unphysical $O(Ma^{-2})$ pressure dissipation via preconditioned HLLC Riemann flux.
+  * **Continuous law of the wall & asymptotic GCI:** $C^\infty$ Spalding root-finding eliminating buffer-layer switching kinks, combined with fixed-point GCI transcendental order estimation.
+  * **Patankar-linearized $k-\epsilon$ turbulence:** Guaranteed negative-slope source linearization preventing unphysical laminar collapse and enabling robust under-relaxation at $\alpha = 0.8$.
 * **Verified, not only validated.** Manufactured solutions on warped meshes show second-order
   convergence for velocity and temperature on quads and triangles. They also exposed a real
   pressure-force bug that the cavity validation had missed. Every SIMPLE/SIMPLEC run also

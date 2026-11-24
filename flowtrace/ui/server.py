@@ -499,6 +499,10 @@ def register_mesh(app: AppState, raw: bytes, name: str) -> dict:
     guess, why = guess_units(mesh)
     if guess != "m":
         info["unit_hint"] = {"unit": guess, "why": why}
+    from ..fluent.case_settings import describe
+
+    # which solver the case needs, and the values a Fluent case file brings with it
+    info["fluent_setup"] = describe(getattr(mesh, "fluent_setup", None), mesh)
     app.mesh_info[mid] = info
     return info
 

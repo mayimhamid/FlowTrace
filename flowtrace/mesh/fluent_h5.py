@@ -203,11 +203,18 @@ def read_case_h5(path: str, name: Optional[str] = None) -> UnstructuredMesh:
     A file that is HDF5 but not a complete CFF mesh raises :class:`FluentMeshError` (a
     ``ValueError``) naming the file and the cause; a missing or non-HDF5 file raises ``OSError``."""
     try:
-        return _read_case_h5(path, name)
+        mesh = _read_case_h5(path, name)
     except FluentMeshError:
         raise
     except (KeyError, IndexError, ValueError, TypeError) as exc:
         raise _malformed(path, "case/mesh file", exc) from exc
+    try:  # models, material and boundary values of a case file (None for a mesh-only file)
+        from ..fluent.case_settings import read_case_settings
+
+        mesh.fluent_setup = read_case_settings(path)
+    except Exception:  # the settings are an extra: a mesh that reads is never refused for them
+        mesh.fluent_setup = None
+    return mesh
 
 
 def _read_case_h5(path: str, name: Optional[str] = None) -> UnstructuredMesh:

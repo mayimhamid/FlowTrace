@@ -10,6 +10,20 @@ Release-readiness work. Every claim below has a script, a test or a results file
 [`RELEASE_READINESS.md`](RELEASE_READINESS.md) lists the commands that were run, their outcomes,
 and what is still open.
 
+### Fixed
+- **Compressible pressure inlet.** The boundary took the static pressure of the interior cell and switched
+  between a subsonic and a "supersonic" branch from one iteration to the next: on a choked nozzle the
+  inlet mass flow cycled between two values and never met the outlet's (4.84 against 3.52 kg/s), the
+  residuals stalled at 0.5 and total temperature exceeded the reservoir's. It is now a characteristic
+  condition (reservoir total enthalpy and entropy in, the upstream-running Riemann invariant out).
+- **Axisymmetric implicit solve diverged above CFL ~ 10.** The radius-weighted face areas of a cell do not
+  sum to zero, so the cell's own state enters its residual through the flux and the pressure source; both
+  were missing from the implicit operator. They are now carried in the sweeps and bound the diagonal.
+  `tests/test_nozzle.py` checks a choked nozzle (planar and axisymmetric) against the isentropic mass
+  flow (3 %) and Mach numbers (6 %) at CFL 50.
+- The automatic mesh unit read a non-dimensional domain 80 units long as millimetres (Re 0.4 instead of
+  400 on the square-cylinder meshes). An extent is now read as millimetres from 100 units up.
+
 ### Added
 - **Mesh certificate** (`flowtrace solve --certify [2|3]`, the dashboard's "Mesh certificate",
   `flowtrace/unstructured/certify.py`): after convergence the mesh is refined uniformly
@@ -19,9 +33,19 @@ and what is still open.
   The run continues with the finest level. Steady 2-D cases without periodic or solid zones
   ([theory](docs/theory/certificate.md), `tests/test_certify.py`).
 - **Mesh unit detected and applied by default** (`--units auto`, the dashboard's "auto-detect"): an
-  extent of 20 or more is read as millimetres and the mesh is scaled to metres, with a warning in the
+  extent of 100 or more is read as millimetres and the mesh is scaled to metres, with a warning in the
   log. Before, the guess was only reported and the file was solved as metres. `--units m` keeps the
   file as it is. Jobs built from Python without `mesh_units` are unchanged (metres).
+- **Fluent case settings and automatic solver choice** (`flowtrace/fluent/case_settings.py`). A CFF
+  `.cas.h5` is no longer read as a mesh only: models, the fluid material and constant boundary values
+  are read from its settings. With `--auto` (dashboard: auto-detect) a case whose density follows the
+  ideal-gas law, or that has a pressure-far-field boundary, is run by the density-based compressible
+  solver with the case's own total pressure, temperatures and gas properties; a 2-D mesh with an axis
+  boundary is run axisymmetric. Before, such a case was solved as incompressible flow with default
+  values. `--solver incompressible|compressible` overrides the choice.
+- `flowtrace solve CASE.cas.h5 --auto --compare DATA.dat.h5`: cell-by-cell difference from a Fluent data
+  file of the same mesh. Compressible runs report physical checks (mass balance, total temperature
+  against the inflow value, positivity) in place of a bare "converged".
 - Logo and favicon (`flowtrace/ui/static/logo.svg`, `favicon.svg`, `favicon.ico`; `docs/assets/`): three
   streamlines through a bend with a tracer particle. Used by the dashboard, the README and the docs site.
 - **Dashboard usability.** Results and log are tabs of a resizable panel; a finished run opens with a

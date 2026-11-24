@@ -64,6 +64,91 @@ def auto_relax_p(non_orthogonality_deg: float) -> float:
     return 1.0 if non_orthogonality_deg <= 5.0 else 0.8
 
 
+class NonOrthogonalPressureCorrector:
+    """
+    Deferred non-orthogonal corrector loop for collocated SIMPLE/SIMPLEC.
+    Reuses the assembled orthogonal pressure-Poisson matrix and AMG hierarchy
+    across inner non-orthogonal sweeps.
+    """
+
+    def __init__(
+        self,
+        owner: np.ndarray,
+        neighbor: np.ndarray,
+        Sf: np.ndarray,
+        d_vec: np.ndarray,
+        weights: np.ndarray,
+        n_cells: int,
+        grad_operator,
+        n_non_ortho_correctors: int = 2,
+    ):
+        self.owner = owner
+        self.neighbor = neighbor
+        self.n_cells = n_cells
+        self.weights = weights
+        self.grad_operator = grad_operator
+        self.n_non_ortho = n_non_ortho_correctors
+
+        # Over-relaxed face decomposition: Sf = alpha_f * d + T_f
+        Sf_dot_d = np.einsum("ij,ij->i", Sf, d_vec)
+        Sf_sq = np.einsum("ij,ij->i", Sf, Sf)
+        self.alpha_f = Sf_sq / np.maximum(Sf_dot_d, 1e-30)
+        self.T_f = Sf - self.alpha_f[:, None] * d_vec
+
+    def solve_pressure_correction(
+        self,
+        F_star: np.ndarray,
+        rho_d_f: np.ndarray,
+        amg_solve,
+        p_prime_init = None,
+    ):
+        """
+        Executes N_non_ortho sweeps without rebuilding the AMG hierarchy.
+        """
+        own = self.owner
+        nei = self.neighbor
+        w = self.weights
+
+        g_orth = rho_d_f * self.alpha_f
+        rhs_base = np.zeros(self.n_cells, dtype=F_star.dtype)
+        np.add.at(rhs_base, own, -F_star)
+        np.add.at(rhs_base, nei, F_star)
+
+        p_prime = (
+            np.zeros(self.n_cells, dtype=F_star.dtype)
+            if p_prime_init is None
+            else p_prime_init.copy()
+        )
+        grad_p_prime = np.zeros((self.n_cells, 3), dtype=F_star.dtype)
+        non_ortho_flux = np.zeros_like(F_star)
+
+        for m in range(self.n_non_ortho):
+            rhs = rhs_base.copy()
+
+            if m > 0:
+                grad_p_prime = self.grad_operator(p_prime)
+                grad_f = (
+                    w[:, None] * grad_p_prime[own]
+                    + (1.0 - w)[:, None] * grad_p_prime[nei]
+                )
+                non_ortho_flux = rho_d_f * np.einsum("ij,ij->i", grad_f, self.T_f)
+                np.add.at(rhs, own, non_ortho_flux)
+                np.add.at(rhs, nei, -non_ortho_flux)
+
+            p_prime = amg_solve(rhs, p_prime)
+
+        grad_p_prime = self.grad_operator(p_prime)
+        grad_f = (
+            w[:, None] * grad_p_prime[own]
+            + (1.0 - w)[:, None] * grad_p_prime[nei]
+        )
+        non_ortho_flux = rho_d_f * np.einsum("ij,ij->i", grad_f, self.T_f)
+        orth_flux = g_orth * (p_prime[nei] - p_prime[own])
+
+        F_corr = F_star - orth_flux - non_ortho_flux
+        return p_prime, grad_p_prime, F_corr
+
+
 _KIND_CODE = {"wall": WALL, "inlet": INLET, "outlet": OUTLET, "pressure": PRESSURE, "symmetry": SYMMETRY}
 T_ADIABATIC, T_FIXED, T_FLUX = range(3)
 
@@ -755,17 +840,40 @@ class SimpleSolver:
         else:
             project = None
         pp, pinfo = pcg(lambda v: Ap @ v, -mass, xp, M=self._amg, tol=c.pressure_tol, maxiter=200, project=project)
+
+        # Deferred non-orthogonal corrector sweeps (reusing frozen Ap and AMG preconditioner)
+        n_no = c.n_non_ortho if c.n_non_ortho is not None else (2 if fv.non_orthogonality_deg > 5.0 else 0)
+        F_no = 0.0
+        Fb_no = 0.0
+        if n_no > 0:
+            for _ in range(n_no):
+                ppb = (1.0 - self.m_pres) * pp[Pb]
+                gpp = fv.gradient(pp, ppb)
+                gpp_f = fv.face_interp_vec(gpp)
+                F_no = rho * dF * xp.sum(gpp_f * fv.Tvec, axis=1)
+                Tvec_b = fv.Sb - fv.alpha_b[:, None] * fv.db
+                Fb_no = rho * dP[Pb] * xp.sum(gpp[Pb] * Tvec_b, axis=1) * self.m_pres
+                rhs = -mass + fv.net_outflow(F_no, Fb_no)
+                pp, pinfo = pcg(lambda v: Ap @ v, rhs, xp, M=self._amg, x0=pp, tol=c.pressure_tol, maxiter=200, project=project)
+            ppb = (1.0 - self.m_pres) * pp[Pb]
+            gpp = fv.gradient(pp, ppb)
+            gpp_f = fv.face_interp_vec(gpp)
+            F_no = rho * dF * xp.sum(gpp_f * fv.Tvec, axis=1)
+            Tvec_b = fv.Sb - fv.alpha_b[:, None] * fv.db
+            Fb_no = rho * dP[Pb] * xp.sum(gpp[Pb] * Tvec_b, axis=1) * self.m_pres
+
         t4 = time.perf_counter()
         tm["pressure"] += t4 - t3
 
         # ---------------- corrections ----------------
-        self.F = Fst + cf * (pp[P] - pp[N])
-        self.Fb = Fbst + cb * pp[Pb]
+        self.F = Fst + cf * (pp[P] - pp[N]) - F_no
+        self.Fb = Fbst + cb * pp[Pb] - Fb_no
         self.p = p + self.relax_p * pp
         if self.singular_p:
             self.p = self.p - self.p.mean()
-        ppb = (1.0 - self.m_pres) * pp[Pb]
-        gpp = fv.gradient(pp, ppb)
+        if n_no == 0:
+            ppb = (1.0 - self.m_pres) * pp[Pb]
+            gpp = fv.gradient(pp, ppb)
         self.U = Ustar - dP[:, None] * gpp
         # references (not copies) to the systems of this iteration, for diagnostics();
         # every array here is rebound, never modified in place, by later iterations

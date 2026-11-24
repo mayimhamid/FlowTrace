@@ -386,7 +386,8 @@ class Job:
             if len(v) == solver.nc:
                 f[k] = v
         names = list(f.keys())
-        field = field if field in names else ("temperature" if "temperature" in f else "velocity-magnitude")
+        default = "mach-number" if "mach-number" in f else "temperature" if "temperature" in f else "velocity-magnitude"
+        field = field if field in names else default
         vals = f[field]
         lo, hi = _display_range(field, vals)
         ev = {"type": "frame", "mesh": "unstructured", "field": field, "fields": names,
@@ -432,6 +433,157 @@ class Job:
             self.log("[certificate] " + line.strip())
         return fine, cert
 
+    def _record_body_forces(self, solver, ucase):
+        """Drag and lift coefficients of the immersed body after every time step of a transient run
+        (the mean drag and the shedding frequency are what such a run is for). Returns the log or None."""
+        zone = getattr(self, "body_zone", None)
+        if not (ucase.unsteady and zone and hasattr(solver, "_advance_time") and hasattr(solver, "wall_forces")):
+            return None
+        q = 0.5 * ucase.density * ucase.ref_velocity ** 2 * ucase.ref_area
+        log = {"t": [], "cd": [], "cl": [], "zone": zone}
+        advance = solver._advance_time
+
+        def advance_and_record():
+            advance()
+            f = solver.wall_forces().get(zone)
+            if f is not None:
+                log["t"].append(float(solver.time))
+                log["cd"].append(float(f["total"][0]) / q)
+                log["cl"].append(float(f["total"][1]) / q)
+
+        solver._advance_time = advance_and_record
+        return log
+
+    def _body_force_report(self, log, ucase) -> dict:
+        """Mean drag, lift amplitude and Strouhal number over the second half of the run."""
+        from ..validation.checks import strouhal
+
+        t, cd, cl = (np.asarray(log[k], dtype=float) for k in ("t", "cd", "cl"))
+        keep = t >= t[0] + 0.5 * (t[-1] - t[0])
+        length = ucase.ref_area  # per unit depth in 2-D: the cross-flow size of the body
+        st = strouhal(t, cl, length=length, speed=ucase.ref_velocity, discard=0.5)
+        amp = float(0.5 * (cl[keep].max() - cl[keep].min()))
+        out = {"zone": log["zone"], "cd_mean": float(cd[keep].mean()), "cl_amplitude": amp, "strouhal": st,
+               "window": [float(t[keep][0]), float(t[-1])], "steps": int(t.size)}
+        shedding = st is not None and amp > 1e-3
+        out["shedding"] = bool(shedding)
+        out["lines"] = [f"{log['zone']}: mean Cd {out['cd_mean']:.4g}, lift amplitude {amp:.3g}"
+                        + (f", Strouhal number {st:.4g}" if shedding else "")
+                        + f" (t = {out['window'][0]:.4g} to {out['window'][1]:.4g} s)"]
+        if not shedding:
+            out["lines"].append("the lift did not oscillate in this window: shedding has not set in yet (run longer) "
+                                "or the flow is steady at this Reynolds number")
+        return out
+
+    # ---------------- compressible (density-based) ----------------
+    def _run_compressible(self, mesh, setup, reasons):
+        """A case that needs the density-based solver: ideal-gas density or a far-field boundary.
+
+        Models, gas properties and boundary values come from the Fluent case file when it has
+        settings; ``spec["compressible"]`` (CompressibleCase fields, per-zone boundaries) overrides them."""
+        from ..compressible.checks import compare_with_fluent, format_comparison, physical_checks
+        from ..compressible.run import build_case
+        from ..compressible.solver import CompressibleSolver
+        from ..fluent.case_settings import compressible_spec
+        from ..unstructured.autoconfig import UNIT_FACTORS, guess_units
+
+        self.log("Solver: density-based compressible (" + ("; ".join(reasons) or "requested") + ")")
+        cspec, notes = compressible_spec(mesh, setup or {})
+        if setup is None:
+            self.log("The file has no case settings (a mesh-only file): boundary values are the defaults "
+                     "(101325 Pa, 300 K, Mach 0) unless given. Set them, or load the .cas.h5 instead.", "warn")
+        user = dict(self.spec.get("compressible") or {})
+        for name, bc in (user.pop("boundaries", None) or {}).items():
+            cspec["boundaries"][name] = {**cspec["boundaries"].get(name, {}), **bc}
+        cspec.update(user)
+        cd = self.spec.get("case") or {}
+        # the dashboard's and the CLI's iteration limit is the pressure-based solver's (a few thousand);
+        # the density-based one counts pseudo-time steps and needs more of them
+        cspec.setdefault("max_iter", max(int(cd.get("max_iter") or 0), 20000))
+        cspec.setdefault("tol", float(cd.get("tol") or 1e-5))
+        cspec.setdefault("name", cd.get("name") or mesh.name)
+        units = self.spec.get("mesh_units") or "m"
+        if setup is not None:
+            units = "m"  # a case file is in metres: Fluent scales the mesh when it is read
+        elif units == "auto":
+            units, why = guess_units(mesh)
+            self.log(f"Units: {why}" + ("; the mesh is scaled to metres" if units != "m" else ""))
+        if UNIT_FACTORS[units] != 1.0:
+            from ..mesh.unstructured import scale_mesh
+
+            mesh = scale_mesh(mesh, UNIT_FACTORS[units])
+        for n in notes:
+            self.log(n)
+        self.setup_notes = notes
+        self.mesh = mesh
+        backend = cd.get("backend") or "auto"
+        if backend == "auto":
+            backend = "numpy"  # the flux kernels are native C++ on the CPU; the GPU path is opt-in
+        case = build_case(mesh, cspec, backend)
+        self.case = case
+        self.set_status("planning", name=case.name)
+        self.log(f"Mesh {mesh.name}: {mesh.n_cells:,} cells, {mesh.n_faces:,} faces, {mesh.dim}D"
+                 + (", axisymmetric" if case.axisymmetric else ""))
+        # A rough count of the arrays held per cell and per face (state, gradients, limiter, fluxes,
+        # geometry, incidence matrices); not measured on large cases. It exists to refuse a case that
+        # would push the machine into swap, with a sentence instead of a frozen desktop.
+        need = 8 * (70 * mesh.n_cells + 45 * mesh.n_faces)
+        try:
+            import psutil  # type: ignore
+
+            free = int(psutil.virtual_memory().available)
+        except Exception:
+            free = 0
+        if free:
+            from ..hardware.memory import fmt_bytes
+
+            self.log(f"Memory: about {fmt_bytes(need)} estimated for {mesh.n_cells:,} cells, {fmt_bytes(free)} free")
+            if need > 0.9 * free:
+                raise MemoryError(f"the density-based solver needs about {fmt_bytes(need)} for {mesh.n_cells:,} cells "
+                                  f"and {mesh.n_faces:,} faces (estimate); {fmt_bytes(free)} of memory is free")
+        solver = CompressibleSolver(mesh, case)
+        self.solver = solver
+        desc = solver.describe()
+        model = "Euler" if not case.viscous else ("RANS k-omega SST" if case.turbulence != "laminar" else "laminar Navier-Stokes")
+        dev = solver.be.device.upper()
+        plan = {"backend": solver.be.name, "device": solver.be.device, "precision": str(solver.dtype), "memory": {},
+                "pressure": "-", "diffusion": "explicit", "measured_ms_per_step": {}, "fmg": [],
+                "placements": [
+                    {"stage": "Inviscid flux", "device": dev, "method": f"HLLC, order {case.order}, "
+                     f"{case.limiter} limiter ({solver.flux_kernel})", "reason": "shock-capturing, conservative"},
+                    {"stage": "Time integration", "device": dev,
+                     "method": "implicit Euler, local time step, CFL ramp" if case.time == "steady-implicit" else case.time,
+                     "reason": f"CFL {case.cfl:g} to {case.cfl_max:g}"},
+                    {"stage": "Model", "device": dev, "method": model, "reason": "; ".join(reasons)}],
+                "notes": [model + (", axisymmetric" if case.axisymmetric else "")]}
+        self.plan = plan
+        self.hub.publish({"type": "plan", "plan": plan, "describe": desc})
+        if mesh.dim == 2:
+            self.hub.publish(self.mesh_geometry_event(mesh))
+        t_solve = time.perf_counter()
+        self._loop(solver, label="density-based")
+        res = {"iterations": solver.iteration, "converged": bool(solver.converged), "describe": desc,
+               "timers": dict(solver.timers), "mass_balance": solver.mass_balance()}
+        res["validation"] = {"checks": physical_checks(solver)}
+        for ch in res["validation"]["checks"]:
+            self.log(f"[validation] {'PASS' if ch['pass'] else 'CHECK'} {ch['name']}: {ch['value']:.4g} {ch.get('unit', '')}")
+        if self.spec.get("compare"):
+            res["comparison"] = compare_with_fluent(solver, self.spec["compare"])
+            for line in format_comparison(res["comparison"]):
+                self.log("[compare] " + line)
+        lo, hi = mesh.bounding_box()
+        res["summary"] = {"seconds": time.perf_counter() - t_solve, "cells": int(mesh.n_cells), "units": units,
+                          "extent": [float(v) for v in (hi - lo)], "turbulence": model, "energy": True,
+                          "algorithm": "density-based", "notes": notes, "reference_values": False}
+        mb = res["mass_balance"]
+        self.log("Mass flow out of each boundary" + (" (per radian)" if case.axisymmetric else "") + ": "
+                 + ", ".join(f"{k} {v:.5g}" for k, v in mb.items()))
+        self.result = res
+        if mesh.dim == 2:
+            self.hub.publish(self.unstructured_frame(solver, self.view_field))
+        status = "stopped" if self._stop.is_set() else ("converged" if solver.converged else "finished")
+        self.set_status(status, result=_jsonable(res))
+
     # ---------------- unstructured (Fluent mesh) ----------------
     def _run_unstructured(self, mesh=None, ucase=None):
         from ..hardware.memory import fmt_bytes
@@ -453,6 +605,14 @@ class Job:
             if mesh is None:
                 raise ValueError("no mesh uploaded (mesh_id not found)")
         self.mesh = mesh
+        want = self.spec.get("solver") or ("auto" if self.spec.get("auto") else "incompressible")
+        if ucase is None and want != "incompressible":
+            from ..fluent.case_settings import choose_solver
+
+            setup = getattr(mesh, "fluent_setup", None)
+            kind, reasons = choose_solver(mesh, setup)
+            if want == "compressible" or kind == "compressible":
+                return self._run_compressible(mesh, setup, reasons)
         if ucase is None:
             cd = dict(self.spec.get("case") or {})
             bnd = default_boundaries(mesh)
@@ -479,7 +639,8 @@ class Job:
             from ..unstructured.autoconfig import auto_configure
 
             if self.spec.get("auto"):
-                mesh, notes, _ = auto_configure(mesh, ucase, units=units)
+                mesh, notes, auto_applied = auto_configure(mesh, ucase, units=units)
+                self.body_zone = auto_applied.get("body_zone")
             else:
                 from ..mesh.unstructured import scale_mesh
                 from ..unstructured.autoconfig import UNIT_FACTORS
@@ -546,6 +707,7 @@ class Job:
             self.log(f"Units: {unit_why}. The file is read as metres; if it was drawn in {unit_guess}, set the mesh "
                      f"length unit to {unit_guess} (otherwise Re and the physics are wrong).", "warn")
         t_solve = time.perf_counter()
+        force_log = self._record_body_forces(solver, ucase)
         try:
             self._loop(solver, label="transient" if ucase.unsteady else "SIMPLE")
         except FloatingPointError as exc:
@@ -583,6 +745,10 @@ class Job:
             self.log(f"diagnostics skipped: {exc}", "warn")
         if certificate is not None:
             res["certificate"] = certificate
+        if force_log and len(force_log["t"]) > 64:
+            res["unsteady_forces"] = self._body_force_report(force_log, ucase)
+            for line in res["unsteady_forces"]["lines"]:
+                self.log("[report] " + line)
         lo, hi = mesh.bounding_box()
         # what the run was, in the terms a user set it up in (the dashboard's summary line)
         res["summary"] = {"seconds": time.perf_counter() - t_solve, "cells": int(mesh.n_cells), "units": units,

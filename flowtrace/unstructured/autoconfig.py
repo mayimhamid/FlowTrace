@@ -4,7 +4,7 @@
 height, mesh skewness, temperatures and species named on the boundaries) and sets the options a
 careful user would set by hand, returning every decision with its reason so the run log shows it:
 
-* mesh length unit: ``units="auto"`` reads an extent of 20 or more as millimetres and scales the mesh (reported);
+* mesh length unit: ``units="auto"`` reads an extent of 100 or more as millimetres and scales the mesh (reported);
 * flow regime from Re = rho U L / mu: laminar below 2300, otherwise a turbulence model, chosen by
   the estimated wall y+ (viscous sublayer resolved -> k-omega SST, wall functions -> realizable k-epsilon);
 * energy equation when the boundaries carry different or fixed temperatures;
@@ -27,15 +27,20 @@ import numpy as np
 from ..mesh.unstructured import UnstructuredMesh, compute_geometry, scale_mesh
 
 AUTO_FIELDS = ("turbulence", "energy", "scheme", "scalar_scheme", "species", "max_iter", "init_T", "t_ref",
-               "ref_velocity", "ref_area")
+               "ref_velocity", "ref_area", "unsteady", "dt", "t_end", "time_scheme")
+# flow past a bluff body sheds vortices above this Reynolds number (circular cylinder ~47, square ~45):
+# a steady solution does not exist as a stable state, and steady iterations do not converge to one
+RE_SHEDDING = 47.0
+SHEDDING_DT = 0.025  # time step in units of L/U: about 250 steps per shedding period at St ~ 0.15
+SHEDDING_T_END = 120.0  # run length in units of L/U: onset from a symmetric start plus ~10 periods
 UNIT_FACTORS = {"m": 1.0, "cm": 1e-2, "mm": 1e-3, "in": 0.0254}
 
 
 def guess_units(mesh: UnstructuredMesh) -> Tuple[str, str]:
     """Length unit of a mesh from its extent: pipes, elbows and test sections are drawn in mm far more
-    often than they are 100 m long, so an extent of 20 or more is read as millimetres."""
+    often than they are 100 m long, so an extent of 100 or more is read as millimetres."""
     span = float(np.ptp(mesh.nodes, axis=0).max())
-    if span >= 20.0:
+    if span >= 100.0:
         return "mm", f"mesh extent {span:g}: looks like millimetres"
     return "m", f"mesh extent {span:g}: metres"
 
@@ -111,7 +116,7 @@ def auto_configure(mesh: UnstructuredMesh, case, units: str = "auto") -> Tuple[U
     # ---- length unit
     if units == "auto":
         # Fluent mesh files carry no unit. The guess is applied and reported; a non-dimensional mesh
-        # more than 20 units wide must be given as units="m".
+        # more than 100 units wide must be given as units="m".
         units, why = guess_units(mesh)
         notes.append(f"auto: mesh unit = {units!r}: {why}" + ("" if units == "m" else
                      "; set the mesh unit to m if the file really is in metres"))
@@ -146,10 +151,18 @@ def auto_configure(mesh: UnstructuredMesh, case, units: str = "auto") -> Tuple[U
             area = length if mesh.dim == 2 else length ** 2
             set_("ref_velocity", float(speed), "inlet speed (reference for Cd, Cl)")
             set_("ref_area", float(area), f"cross-flow size of '{body[0]}'" + (" x unit depth" if mesh.dim == 2 else " squared"))
-        if body is not None and re > 47.0:
-            notes.append(f"warning: Re {re:.3g} > ~47 past a bluff body: the wake sheds vortices periodically, so steady "
-                         "iterations will not settle to a physical solution. Enable Transient (time step ~ "
-                         f"{0.02 * length / speed:.3g} s = 0.02 L/U) for drag, lift and Strouhal number.")
+        if body is not None:
+            applied["body_zone"] = body[0]
+        if body is not None and re > RE_SHEDDING and not case.unsteady:
+            # the physical state is periodic vortex shedding: solve it in time instead of iterating
+            # towards a steady state that the flow does not have
+            tau = length / speed
+            set_("unsteady", True, f"Re {re:.3g} > ~{RE_SHEDDING:g} past the bluff body '{body[0]}': the wake sheds "
+                 "vortices, a steady solution is not physical")
+            set_("dt", SHEDDING_DT * tau, f"{SHEDDING_DT:g} L/U (about 250 steps per shedding period)")
+            set_("t_end", SHEDDING_T_END * tau, f"{SHEDDING_T_END:g} L/U: onset of shedding and about ten periods")
+            set_("time_scheme", "bdf2", "second order in time")
+            applied["shedding_steps"] = int(round(SHEDDING_T_END / SHEDDING_DT))
         walls = [n for n, b in case.boundaries.items() if b.kind == "wall"]
         wf = np.concatenate([_zone_faces(mesh, n) for n in walls]) if walls else np.zeros(0, int)
         if re < 2300.0:
@@ -194,6 +207,8 @@ def auto_configure(mesh: UnstructuredMesh, case, units: str = "auto") -> Tuple[U
     if skew > 60.0:
         set_("scheme", "upwind", f"{skew:.0f} deg non-orthogonality: second-order momentum is not robust")
     budget = 3000 if mesh.n_cells < 100_000 else 5000
+    if case.unsteady:  # max_iter counts every inner iteration of every time step
+        budget = max(budget, int(math.ceil(case.t_end / case.dt)) * int(case.inner_iterations) + 1)
     if case.max_iter < budget:
         set_("max_iter", budget, f"{mesh.n_cells:,} cells")
     notes.append(f"mesh: max non-orthogonality {skew:.1f} deg")

@@ -84,6 +84,8 @@ class UnstructuredCase:
     # pressure under-relaxation; None = automatic: SIMPLE 0.3, SIMPLEC 1.0 on orthogonal meshes and
     # 0.8 when the mesh is non-orthogonal (> 5 deg), following Fluent's guidance for skewed meshes
     relax_p: Optional[float] = None
+    # non-orthogonal correctors for pressure; None = auto (0 if <= 5 deg, 2 if > 5 deg)
+    n_non_ortho: Optional[int] = None
     relax_T: float = 1.0
     scheme: str = "second-order"  # upwind | second-order
     # convection scheme of energy and species (None: as ``scheme``); first-order stays within the boundary
