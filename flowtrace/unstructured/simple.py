@@ -3,8 +3,8 @@ r"""Pressure-based segregated solver (SIMPLE / SIMPLEC) on unstructured meshes.
 This mirrors the algorithm behind Fluent's default pressure-based solver:
 
 * collocated cell-centred finite volumes on arbitrary polyhedra;
-* momentum: implicit first-order upwind + deferred-correction bounded
-  second-order upwind, central diffusion with explicit non-orthogonal
+* momentum: upwind, deferred-correction bounded second-order upwind, or
+  skew-symmetric convection, central diffusion with explicit non-orthogonal
   correction (over-relaxed decomposition), least-squares gradients;
 * Rhie-Chow face-flux interpolation to suppress pressure checkerboarding;
 * pressure-correction equation solved with AMG-preconditioned CG;
@@ -199,7 +199,9 @@ class SimpleSolver:
         ub = self._velocity_bvals(self.U)
         self.F = case.density * xp.sum(fv.face_interp_vec(self.U) * fv.S, axis=1)
         self.Fb = self._boundary_flux_fixed(ub)
-        self.mom_source = None  # (nc, dim) per unit volume
+        self.mom_source = None  # (nc, dim), integrated over each cell
+        self._momentum_forcing = None
+        self._forcing_step = None
         self.energy_source = None  # (nc,) volumetric heat source per unit volume
         from .turbulence import make_turbulence
 
@@ -256,15 +258,19 @@ class SimpleSolver:
     def set_sources(self, momentum=None, energy=None) -> None:
         """Volumetric sources: momentum (nc, dim) [force/volume], energy (nc,) [heat/volume].
 
-        Used for manufactured-solution verification and spatially varying body
-        forces; a uniform body force is ``case.body_force``.
+        Momentum may also be a callable ``momentum(centres, time)`` returning
+        force per volume as a NumPy array of shape (nc, dim). For transient
+        runs it is sampled at the end of each physical time step. For steady
+        runs it is sampled at time zero. A uniform body force is ``case.body_force``.
         """
         xp = self.xp
-        if momentum is not None:
+        if momentum is not None and not callable(momentum):
             m = np.asarray(momentum, dtype=np.float64).reshape(self.nc, self.dim)
             self.mom_source = xp.asarray(m * self.be.to_numpy(self.fv.vol)[:, None], dtype=self.dtype)
         else:
             self.mom_source = None
+        self._momentum_forcing = momentum if callable(momentum) else None
+        self._forcing_step = None
         if energy is not None:
             if not self.energy:
                 raise ValueError("energy source given but the energy equation is off")
@@ -272,6 +278,16 @@ class SimpleSolver:
             self.energy_source = xp.asarray(e * self.be.to_numpy(self.fv.vol) / self.case.cp, dtype=self.dtype)
         else:
             self.energy_source = None
+
+    def _sample_momentum_forcing(self):
+        if self._momentum_forcing is None or self._forcing_step == self.time_step:
+            return
+        time = self.time + self.case.dt if self.case.unsteady else 0.0
+        force = np.asarray(self._momentum_forcing(self.cell_centres(), time), dtype=np.float64)
+        if force.shape != (self.nc, self.dim) or not np.isfinite(force).all():
+            raise ValueError(f"momentum forcing must return a finite array of shape {(self.nc, self.dim)}")
+        self.mom_source = self.xp.asarray(force, dtype=self.dtype) * self.fv.vol[:, None]
+        self._forcing_step = self.time_step
 
     # ------------------------------------------------------------------
     def _build_boundaries(self):
@@ -429,8 +445,8 @@ class SimpleSolver:
             return gamma
         return gamma, gamma
 
-    def _coefficients(self, gamma, dirichlet, conv=None):
-        """Implicit part of div(F phi) - div(gamma grad phi): (diag, aPN, aNP, Db).
+    def _coefficients(self, gamma, dirichlet, conv=None, *, skew_symmetric=False):
+        """Implicit convection and diffusion: (diag, aPN, aNP, Db).
 
         ``gamma`` is a scalar or a tuple (interior-face values, boundary-face values).
         ``conv``: the convecting (F, Fb); default the solver's current fluxes.
@@ -439,9 +455,16 @@ class SimpleSolver:
         F, Fb = conv if conv is not None else self._conv()
         gf, gb = self._split_gamma(gamma)
         D = gf * fv.alpha
+        Db = gb * fv.alpha_b * dirichlet
+        if skew_symmetric:
+            # Central face transport minus half the cell mass imbalance times
+            # phi. The central diagonal cancels exactly on interior faces.
+            # Physical boundaries retain their upwind flux with the same split.
+            half_flux = 0.5 * F
+            diag = fv.scatter(D, D, Db + 0.5 * xp.abs(Fb))
+            return diag, half_flux - D, -half_flux - D, Db
         aPN = -(D + xp.maximum(-F, 0.0))  # coefficient of phi_N in P's row
         aNP = -(D + xp.maximum(F, 0.0))  # coefficient of phi_P in N's row
-        Db = gb * fv.alpha_b * dirichlet
         diag = fv.scatter(D + xp.maximum(F, 0.0), D + xp.maximum(-F, 0.0), Db + xp.maximum(Fb, 0.0))
         return diag, aPN, aNP, Db
 
@@ -666,7 +689,7 @@ class SimpleSolver:
             Yb = xp.where(fixed, self.Yb[name], Y[fv.Pb])
             gY = fv.gradient(Y, Yb)
             diag, aPN, aNP, Db = self._coefficients(gam, self.Ydir[name], conv)
-            rhs = self._rhs(gam, Y, gY, Yb, Db, scheme=c.scalar_scheme, conv=conv)
+            rhs = self._rhs(gam, Y, gY, Yb, Db, scheme=c.scalar_convection, conv=conv)
             diag, rhs = self._time_terms(f"Y:{name}", Y, diag, rhs, inp.get("time"))
             A = fv.matrix(diag, aPN, aNP)
             res[name] = self._residual(A, diag, Y, rhs)
@@ -731,6 +754,7 @@ class SimpleSolver:
         tm["gradients"] += t1 - t0
 
         # ---------------- momentum ----------------
+        self._sample_momentum_forcing()
         src = -gp * fv.vol[:, None]
         if self.energy and any(c.buoyancy[:dim]):
             bv = xp.asarray(np.asarray(c.buoyancy[:dim]), dtype=self.dtype)
@@ -757,8 +781,11 @@ class SimpleSolver:
         res = {}
         Ustar = xp.empty_like(U)
         au = self.relax_u
-        diag, aPN, aNP, Db = self._coefficients(gm, self.m_dirvel)
-        rhs_all = [self._rhs(gm, U[:, k], gU[k], ub[:, k], Db, src[:, k]) for k in range(dim)]
+        conv = self._conv()
+        diag, aPN, aNP, Db = self._coefficients(
+            gm, self.m_dirvel, conv, skew_symmetric=c.scheme == "skew-symmetric"
+        )
+        rhs_all = [self._rhs(gm, U[:, k], gU[k], ub[:, k], Db, src[:, k], conv=conv) for k in range(dim)]
         tcoef = self._time_coeffs()
         if tcoef is not None:
             rv = rho * fv.vol / c.dt
@@ -1076,7 +1103,7 @@ class SimpleSolver:
         if inp["src"] is not None:
             q_in = q_in + inp["src"]
         diag, aPN, aNP, Db = self._coefficients(gam, fixed.astype(self.dtype), conv)
-        rhs = self._rhs(gam, T, gT, Tb, Db, q_in, scheme=c.scalar_scheme, conv=conv)
+        rhs = self._rhs(gam, T, gT, Tb, Db, q_in, scheme=c.scalar_convection, conv=conv)
         if self.rad is not None:
             dd, rr = self.rad.energy_terms(T)
             diag = diag + dd

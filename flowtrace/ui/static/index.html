@@ -123,7 +123,7 @@
           <div class="card" id="unstructSolverCard">
             <h3 data-i18n="pbSolver">Pressure-based solver</h3>
             <label class="field"><span data-i18n="scheme">Scheme</span><select id="algorithm"><option>SIMPLEC</option><option>SIMPLE</option></select></label>
-            <label class="field"><span data-i18n="momDisc">Momentum discretisation</span><select id="uScheme"><option value="second-order" data-i18n="so">Second-order upwind</option><option value="upwind" data-i18n="upwind1">First-order upwind</option></select></label>
+            <label class="field"><span data-i18n="momDisc">Momentum discretisation</span><select id="uScheme"><option value="second-order" data-i18n="so">Second-order upwind</option><option value="upwind" data-i18n="upwind1">First-order upwind</option><option value="skew-symmetric" data-i18n="skewSymmetric">Skew-symmetric central</option></select></label>
             <label class="field"><span data-i18n="relaxU">Relaxation: momentum</span><input type="number" id="relaxU" value="0.7" step="0.05"></label>
             <label class="field"><span data-i18n="relaxP">Relaxation: pressure</span><input type="number" id="relaxP" value="" placeholder="auto" step="0.05"></label>
             <label class="field"><span data-i18n="maxIter">Max iterations</span><input type="number" id="maxIter" value="3000"></label>

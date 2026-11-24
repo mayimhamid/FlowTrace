@@ -87,9 +87,9 @@ class UnstructuredCase:
     # non-orthogonal correctors for pressure; None = auto (0 if <= 5 deg, 2 if > 5 deg)
     n_non_ortho: Optional[int] = None
     relax_T: float = 1.0
-    scheme: str = "second-order"  # upwind | second-order
-    # convection scheme of energy and species (None: as ``scheme``); first-order stays within the boundary
-    # values where the second-order scheme overshoots (skewed meshes)
+    scheme: str = "second-order"  # upwind | second-order | skew-symmetric
+    # Energy and species inherit the upwind scheme, or use second-order
+    # upwind when momentum is skew-symmetric.
     scalar_scheme: Optional[str] = None  # None | upwind | second-order
     # pressure force in momentum: "green-gauss" = sum_f p_f S_f (face pressures, as
     # Fluent does; consistent on triangles) | "least-squares" (cell LS gradient)
@@ -169,6 +169,10 @@ class UnstructuredCase:
         if self.time_scheme not in ("euler", "bdf2"):
             raise ValueError("time_scheme must be 'euler' or 'bdf2'")
         self.periodic = [list(p) for p in self.periodic]
+
+    @property
+    def scalar_convection(self) -> str:
+        return self.scalar_scheme or ("second-order" if self.scheme == "skew-symmetric" else self.scheme)
 
     @property
     def turbulent(self) -> bool:
