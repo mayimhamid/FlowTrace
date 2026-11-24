@@ -245,9 +245,10 @@ def evaluate(solver) -> dict:
         r0 = ecap["br"] - ecap["Ar"] @ ecap["T_old"]
         sc.add("T_true_r0", xp.sqrt(xp.sum(r0 * r0)))
 
-    # ---- pressure correction A_p p' = -m* ----
-    _row_set(sc, xp, "pcorr", [("p-correction",) + _rows_of_system(fv, cap["Ap"], -cap["mass"], cap["pp"])],
+    # ---- final pressure-correction system ----
+    _row_set(sc, xp, "pcorr", [("p-correction",) + _rows_of_system(fv, cap["Ap"], cap["pressure_rhs"], cap["pp"])],
              K_rows, u)
+    sc.add("pcorr_rhs_l2", xp.linalg.norm(cap["pressure_rhs"]))
 
     # ---- local continuity: predictor (F*, Fb*) and corrected (F^{n+1}, Fb^{n+1}) ----
     for tag, F, Fb in (("pred", cap["Fst"], cap["Fbst"]), ("corr", cap["F"], cap["Fb"])):
@@ -320,8 +321,8 @@ def evaluate(solver) -> dict:
 
     pc = _row_report(vals, "pcorr", "p-correction", centres)
     pc["linear_solver"] = _linear_info(cap.get("p_info"))
-    pc["relative_l2"] = ratio(pc["abs_l2"], vals["cont_pred|cells|l2"])
-    pc["definition"] = "A_p p' = -m* (rhs = minus the predictor imbalance); residual = -(corrected imbalance)"
+    pc["relative_l2"] = ratio(pc["abs_l2"], vals["pcorr_rhs_l2"])
+    pc["definition"] = "A_p p' = rhs (rhs includes the lagged tangential flux); residual = -(corrected imbalance)"
     out["pressure_correction"] = pc
 
     cont: dict = {"units": "kg/s (per unit depth in 2-D), positive = net outflow"}

@@ -103,7 +103,7 @@ class NonOrthogonalPressureCorrector:
         p_prime_init = None,
     ):
         """
-        Executes N_non_ortho sweeps without rebuilding the AMG hierarchy.
+        Solve the orthogonal system and apply the configured correction sweeps.
         """
         own = self.owner
         nei = self.neighbor
@@ -119,30 +119,18 @@ class NonOrthogonalPressureCorrector:
             if p_prime_init is None
             else p_prime_init.copy()
         )
-        grad_p_prime = np.zeros((self.n_cells, 3), dtype=F_star.dtype)
         non_ortho_flux = np.zeros_like(F_star)
-
-        for m in range(self.n_non_ortho):
+        for sweep in range(self.n_non_ortho + 1):
             rhs = rhs_base.copy()
-
-            if m > 0:
-                grad_p_prime = self.grad_operator(p_prime)
-                grad_f = (
-                    w[:, None] * grad_p_prime[own]
-                    + (1.0 - w)[:, None] * grad_p_prime[nei]
-                )
+            if sweep:
+                grad = self.grad_operator(p_prime)
+                grad_f = w[:, None] * grad[own] + (1.0 - w[:, None]) * grad[nei]
                 non_ortho_flux = rho_d_f * np.einsum("ij,ij->i", grad_f, self.T_f)
                 np.add.at(rhs, own, non_ortho_flux)
                 np.add.at(rhs, nei, -non_ortho_flux)
-
             p_prime = amg_solve(rhs, p_prime)
 
         grad_p_prime = self.grad_operator(p_prime)
-        grad_f = (
-            w[:, None] * grad_p_prime[own]
-            + (1.0 - w)[:, None] * grad_p_prime[nei]
-        )
-        non_ortho_flux = rho_d_f * np.einsum("ij,ij->i", grad_f, self.T_f)
         orth_flux = g_orth * (p_prime[nei] - p_prime[own])
 
         F_corr = F_star - orth_flux - non_ortho_flux
@@ -186,7 +174,7 @@ class SimpleSolver:
         self._amg_age = 10 ** 9
         self.amg_rebuild = 10
         self.last_linear = {}
-        self._gp = self._gU = self._gT = None  # lagged gradients for boundary reconstruction
+        self._gp = self._gp_eff = self._gU = self._gT = None  # lagged gradients for boundary reconstruction
         self.external_energy = False  # True when a conjugate (fluid+solid) solver owns the energy equation
         self.relax_p = float(case.relax_p) if case.relax_p is not None else auto_relax_p(fv.non_orthogonality_deg)
         self._build_boundaries()
@@ -249,7 +237,7 @@ class SimpleSolver:
         ub = self._velocity_bvals(self.U)
         self.F = self.case.density * xp.sum(self.fv.face_interp_vec(self.U) * self.fv.S, axis=1)
         self.Fb = self._boundary_flux_fixed(ub)
-        self._gp = self._gU = self._gT = None
+        self._gp = self._gp_eff = self._gU = self._gT = None
         if self._bridge is not None:
             self._bridge.mark_dirty()
         self._capture = None  # the fields changed: the last iteration's systems no longer describe them
@@ -261,32 +249,38 @@ class SimpleSolver:
         Momentum may also be a callable ``momentum(centres, time)`` returning
         force per volume as a NumPy array of shape (nc, dim). For transient
         runs it is sampled at the end of each physical time step. For steady
-        runs it is sampled at time zero. A uniform body force is ``case.body_force``.
+        runs it is sampled at time zero. Closed and periodic domains remove
+        the callback's volume-weighted mean. A uniform body force is ``case.body_force``.
         """
         xp = self.xp
+        mom_source = energy_source = None
         if momentum is not None and not callable(momentum):
             m = np.asarray(momentum, dtype=np.float64).reshape(self.nc, self.dim)
-            self.mom_source = xp.asarray(m * self.be.to_numpy(self.fv.vol)[:, None], dtype=self.dtype)
-        else:
-            self.mom_source = None
-        self._momentum_forcing = momentum if callable(momentum) else None
-        self._forcing_step = None
+            mom_source = xp.asarray(m * self.be.to_numpy(self.fv.vol)[:, None], dtype=self.dtype)
         if energy is not None:
             if not self.energy:
                 raise ValueError("energy source given but the energy equation is off")
             e = np.asarray(energy, dtype=np.float64).reshape(self.nc)
-            self.energy_source = xp.asarray(e * self.be.to_numpy(self.fv.vol) / self.case.cp, dtype=self.dtype)
-        else:
-            self.energy_source = None
+            energy_source = xp.asarray(e * self.be.to_numpy(self.fv.vol) / self.case.cp, dtype=self.dtype)
+        self.mom_source, self.energy_source = mom_source, energy_source
+        self._momentum_forcing = momentum if callable(momentum) else None
+        self._forcing_step = None
 
-    def _sample_momentum_forcing(self):
+    def _sample_momentum_forcing(self) -> None:
         if self._momentum_forcing is None or self._forcing_step == self.time_step:
             return
         time = self.time + self.case.dt if self.case.unsteady else 0.0
-        force = np.asarray(self._momentum_forcing(self.cell_centres(), time), dtype=np.float64)
+        centres = self.cell_centres().view()
+        centres.flags.writeable = False
+        force = np.asarray(self._momentum_forcing(centres, time), dtype=np.float64)
         if force.shape != (self.nc, self.dim) or not np.isfinite(force).all():
             raise ValueError(f"momentum forcing must return a finite array of shape {(self.nc, self.dim)}")
-        self.mom_source = self.xp.asarray(force, dtype=self.dtype) * self.fv.vol[:, None]
+        xp, vol = self.xp, self.fv.vol
+        integrated = xp.asarray(force, dtype=self.dtype) * vol[:, None]
+        if self.singular_p and not (self.bkind_h == INLET).any():
+            mean = xp.sum(integrated, axis=0) / xp.sum(vol)
+            integrated = integrated - vol[:, None] * mean
+        self.mom_source = integrated
         self._forcing_step = self.time_step
 
     # ------------------------------------------------------------------
@@ -423,14 +417,16 @@ class SimpleSolver:
         fixed = (self.m_wall + self.m_inlet)[:, None]
         return fixed * self.ub_fixed + self.m_sym[:, None] * sym + self.m_pres[:, None] * UP
 
-    def _pressure_bvals(self, p, gp=None):
+    def _pressure_bvals(self, p, gp=None, p_fixed=None):
         """Wall/inlet/symmetry face pressure: linear extrapolation from the owner
         cell with the (lagged) gradient; fixed value on pressure boundaries."""
         fv = self.fv
         pP = p[fv.Pb]
         if gp is not None:
             pP = pP + self.xp.sum(gp[fv.Pb] * fv.db, axis=1)
-        return self.m_pres * self.pb_fixed + (1.0 - self.m_pres) * pP
+        if p_fixed is None:
+            p_fixed = self.pb_fixed
+        return self.m_pres * p_fixed + (1.0 - self.m_pres) * pP
 
     def _boundary_flux_fixed(self, ub):
         fv = self.fv
@@ -445,7 +441,7 @@ class SimpleSolver:
             return gamma
         return gamma, gamma
 
-    def _coefficients(self, gamma, dirichlet, conv=None, *, skew_symmetric=False):
+    def _coefficients(self, gamma, dirichlet, conv=None, *, skew_symmetric=False, upwind_diffusion=0.0):
         """Implicit convection and diffusion: (diag, aPN, aNP, Db).
 
         ``gamma`` is a scalar or a tuple (interior-face values, boundary-face values).
@@ -461,12 +457,25 @@ class SimpleSolver:
             # phi. The central diagonal cancels exactly on interior faces.
             # Physical boundaries retain their upwind flux with the same split.
             half_flux = 0.5 * F
+            D = D + upwind_diffusion
             diag = fv.scatter(D, D, Db + 0.5 * xp.abs(Fb))
             return diag, half_flux - D, -half_flux - D, Db
         aPN = -(D + xp.maximum(-F, 0.0))  # coefficient of phi_N in P's row
         aNP = -(D + xp.maximum(F, 0.0))  # coefficient of phi_P in N's row
         diag = fv.scatter(D + xp.maximum(F, 0.0), D + xp.maximum(-F, 0.0), Db + xp.maximum(Fb, 0.0))
         return diag, aPN, aNP, Db
+
+    def _skew_upwind_diffusion(self, U, gU, F):
+        """Bounded upwind dissipation where reconstructed gradients miss the velocity jump."""
+        fv, xp = self.fv, self.xp
+        jump = U[fv.N] - U[fv.P]
+        reconstructed = xp.stack(
+            [xp.sum(fv.face_interp_vec(grad) * fv.d, axis=1) for grad in gU], axis=1
+        )
+        jump2 = xp.sum(jump * jump, axis=1)
+        alignment = xp.sum(reconstructed * jump, axis=1) / xp.where(jump2 > 0.0, jump2, 1.0)
+        fraction = xp.where(jump2 > 0.0, xp.clip(1.0 - 2.0 * alignment, 0.0, 1.0), 0.0)
+        return 0.5 * xp.abs(F) * fraction
 
     def _rhs(self, gamma, phi, grad, phi_b, Db, extra=None, scheme=None, conv=None):
         """Boundary sources + explicit non-orthogonal and second-order corrections."""
@@ -743,13 +752,23 @@ class SimpleSolver:
         ub = self._velocity_bvals(U, self._gU)
         pb = self._pressure_bvals(p, self._gp)
         gp_ls = fv.gradient(p, pb)
-        gp = gp_ls
-        if c.pressure_gradient == "green-gauss":
-            # face-pressure force: the discrete adjoint of the face-flux divergence,
-            # which keeps the saddle-point system consistent on triangles
-            gp = fv.gradient_gg(p, pb, gp_ls)
         gU = [fv.gradient(U[:, k], ub[:, k]) for k in range(dim)]
-        self._gp, self._gU = gp, gU
+        self._gU = gU
+        use_gg = c.pressure_gradient == "green-gauss"
+        self._gp = fv.gradient_gg(p, pb, gp_ls) if use_gg else gp_ls
+        gp = self._gp
+        p_open = self.pb_fixed
+        if self.turb is not None:
+            k = self.turb.k
+            kb, _ = self.turb._bvals(k, self.turb.kb_in)
+            scale = (2.0 / 3.0) * rho
+            p = p + scale * k
+            p_open = p_open + scale * kb
+            pb = self._pressure_bvals(p, self._gp_eff, p_open)
+            gp = fv.gradient(p, pb)
+            if use_gg:
+                gp = fv.gradient_gg(p, pb, gp)
+            self._gp_eff = gp
         t1 = time.perf_counter()
         tm["gradients"] += t1 - t0
 
@@ -777,13 +796,15 @@ class SimpleSolver:
         gm = mu
         if self.turb is not None:
             gm = self.turb.momentum_viscosity(U)  # mu + mu_t on faces, wall-function mu_w on walls
-            src = src + self.turb.transpose_stress(gU)
+            src = src + self.turb.transpose_stress(gU, gm)
         res = {}
         Ustar = xp.empty_like(U)
         au = self.relax_u
         conv = self._conv()
+        skew = c.scheme == "skew-symmetric"
+        upwind_diffusion = self._skew_upwind_diffusion(U, gU, conv[0]) if skew else 0.0
         diag, aPN, aNP, Db = self._coefficients(
-            gm, self.m_dirvel, conv, skew_symmetric=c.scheme == "skew-symmetric"
+            gm, self.m_dirvel, conv, skew_symmetric=skew, upwind_diffusion=upwind_diffusion
         )
         rhs_all = [self._rhs(gm, U[:, k], gU[k], ub[:, k], Db, src[:, k], conv=conv) for k in range(dim)]
         tcoef = self._time_coeffs()
@@ -844,7 +865,7 @@ class SimpleSolver:
         Pb = fv.Pb
         Fb_in = rho * xp.sum(self.ub_fixed * fv.Sb, axis=1) * self.m_inlet
         Fb_pr = rho * (xp.sum(Ustar[Pb] * fv.Sb, axis=1)
-                       - dP[Pb] * fv.alpha_b * (self.pb_fixed - p[Pb] - xp.sum(gp[Pb] * fv.db, axis=1)))
+                       - dP[Pb] * fv.alpha_b * (p_open - p[Pb] - xp.sum(gp[Pb] * fv.db, axis=1)))
         Fbst = Fb_in + Fb_pr * self.m_pres
 
         # ---------------- pressure correction ----------------
@@ -866,7 +887,8 @@ class SimpleSolver:
                 return v - v.mean()
         else:
             project = None
-        pp, pinfo = pcg(lambda v: Ap @ v, -mass, xp, M=self._amg, tol=c.pressure_tol, maxiter=200, project=project)
+        pressure_rhs = -mass
+        pp, pinfo = pcg(lambda v: Ap @ v, pressure_rhs, xp, M=self._amg, tol=c.pressure_tol, maxiter=200, project=project)
 
         # Deferred non-orthogonal corrector sweeps (reusing frozen Ap and AMG preconditioner)
         n_no = c.n_non_ortho if c.n_non_ortho is not None else (2 if fv.non_orthogonality_deg > 5.0 else 0)
@@ -880,33 +902,28 @@ class SimpleSolver:
                 F_no = rho * dF * xp.sum(gpp_f * fv.Tvec, axis=1)
                 Tvec_b = fv.Sb - fv.alpha_b[:, None] * fv.db
                 Fb_no = rho * dP[Pb] * xp.sum(gpp[Pb] * Tvec_b, axis=1) * self.m_pres
-                rhs = -mass + fv.net_outflow(F_no, Fb_no)
-                pp, pinfo = pcg(lambda v: Ap @ v, rhs, xp, M=self._amg, x0=pp, tol=c.pressure_tol, maxiter=200, project=project)
-            ppb = (1.0 - self.m_pres) * pp[Pb]
-            gpp = fv.gradient(pp, ppb)
-            gpp_f = fv.face_interp_vec(gpp)
-            F_no = rho * dF * xp.sum(gpp_f * fv.Tvec, axis=1)
-            Tvec_b = fv.Sb - fv.alpha_b[:, None] * fv.db
-            Fb_no = rho * dP[Pb] * xp.sum(gpp[Pb] * Tvec_b, axis=1) * self.m_pres
-
+                pressure_rhs = -mass + fv.net_outflow(F_no, Fb_no)
+                pp, pinfo = pcg(lambda v: Ap @ v, pressure_rhs, xp, M=self._amg, x0=pp,
+                                tol=c.pressure_tol, maxiter=200, project=project)
+        # Reuse the lagged tangential fluxes from the final Poisson RHS.
         t4 = time.perf_counter()
         tm["pressure"] += t4 - t3
 
         # ---------------- corrections ----------------
         self.F = Fst + cf * (pp[P] - pp[N]) - F_no
         self.Fb = Fbst + cb * pp[Pb] - Fb_no
-        self.p = p + self.relax_p * pp
+        p_prev = self.p
+        self.p = p_prev + self.relax_p * pp
         if self.singular_p:
             self.p = self.p - self.p.mean()
-        if n_no == 0:
-            ppb = (1.0 - self.m_pres) * pp[Pb]
-            gpp = fv.gradient(pp, ppb)
+        ppb = (1.0 - self.m_pres) * pp[Pb]
+        gpp = fv.gradient(pp, ppb)
         self.U = Ustar - dP[:, None] * gpp
         # references (not copies) to the systems of this iteration, for diagnostics();
         # every array here is rebound, never modified in place, by later iterations
-        cap = {"U_old": U, "p_old": p, "A": A, "b": rhs_all, "Ar": Ar, "br": brs, "U_star": Ustar,
+        cap = {"U_old": U, "p_old": p_prev, "A": A, "b": rhs_all, "Ar": Ar, "br": brs, "U_star": Ustar,
                "mom_info": infos, "alpha_u": au, "Fst": Fst, "Fbst": Fbst, "mass": mass, "Ap": Ap, "pp": pp,
-               "p_info": pinfo, "F": self.F, "Fb": self.Fb, "U_new": self.U, "p_new": self.p}
+               "pressure_rhs": pressure_rhs, "p_info": pinfo, "F": self.F, "Fb": self.Fb, "U_new": self.U, "p_new": self.p}
 
         # ---------------- energy ----------------
         bridge = self._bridge
@@ -927,6 +944,12 @@ class SimpleSolver:
             gUc = [fv.gradient(self.U[:, k], ubc[:, k]) for k in range(dim)]
             k_old, w_old = self.turb.k, self.turb.w
             res.update(self.turb.solve(gUc))
+            # Keep the pressure-correction variable fixed while the separately
+            # transported k changes. Public pressure remains mechanical pressure.
+            self.p = self.p + (2.0 / 3.0) * rho * (k_old - self.turb.k)
+            if self.singular_p:
+                self.p = self.p - self.p.mean()
+            cap["p_new"] = self.p
             cap["turbulence"] = {"k": (k_old, self.turb.k), self.turb.second: (w_old, self.turb.w)}
             tm["turbulence"] += time.perf_counter() - t5
         if self._Y:
@@ -1355,6 +1378,12 @@ class SimpleSolver:
             st["T"] = h(self.T)
         if self.turb is not None:
             st.update(self.turb.state())
+            if self._gp is not None:
+                st["grad_p"] = h(self._gp)
+            if self._gp_eff is not None:
+                st["grad_p_eff"] = h(self._gp_eff)
+            if self._gU is not None:
+                st["grad_U"] = h(self.xp.stack(self._gU))
         st["time"], st["time_step"] = self.time, self.time_step
         st["res_continuity_norm"] = self._res_max5.get("continuity", 0.0)
         if self.rad is not None:
@@ -1380,7 +1409,11 @@ class SimpleSolver:
             if f"Y:{name}" in st:
                 self.Y[name] = xp.asarray(st[f"Y:{name}"], dtype=self.dtype)
         self.iteration = int(st.get("iteration", 0))
-        self._gp = self._gU = self._gT = None
+        self._gp = xp.asarray(st["grad_p"], dtype=self.dtype) if "grad_p" in st else None
+        self._gp_eff = xp.asarray(st["grad_p_eff"], dtype=self.dtype) if "grad_p_eff" in st else None
+        self._gU = xp.asarray(st["grad_U"], dtype=self.dtype) if "grad_U" in st else None
+        self._gT = None
+        self._forcing_step = None
         self._capture = None  # diagnostics describe an iteration, not a restored state
         if self.turb is not None:
             self.turb.load(st)

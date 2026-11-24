@@ -98,7 +98,7 @@ def test_guard_recovers_simplec_on_45_degree_sheared_mesh():
         mesh = cartesian_mesh_2d(24, 24)
         mesh.nodes[:, 0] = mesh.nodes[:, 0] + mesh.nodes[:, 1]
         case = UnstructuredCase(boundaries={"top": BoundarySpec("wall", velocity=[1.0, 0.0])}, viscosity=0.1,
-                                max_iter=3000, tol=1e-6, backend="numpy", relax_p=relax_p)
+                                max_iter=3000, tol=1e-6, backend="numpy", relax_p=relax_p, n_non_ortho=0)
         s = SimpleSolver(mesh, case)
         while not s.finished and np.isfinite(s.residuals()["raw"].get("continuity", 0.0)):
             s.step()

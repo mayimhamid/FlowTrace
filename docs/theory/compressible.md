@@ -18,10 +18,23 @@ results for them come from its density-based solver.
 | Viscous flux | constant or Sutherland viscosity, face gradients from averaged cell gradients with a directional correction, Fourier heat flux at constant Prandtl number |
 | Axisymmetric | radius-weighted face areas and volumes, plus the source `p − 2μ(v/r − ∇·u/3)` in the radial momentum equation |
 | Steady time stepping | implicit Euler with a local time step: the first-order Rusanov Jacobian is applied matrix-free with Jacobi sweeps, CFL ramped from `cfl` up to `cfl_max` while the residual falls |
-| Transient | SSP-RK3 with a global time step |
+| Transient | SSP-RK3 by default, or implicit Euler with Weiss-Smith dual-time stepping |
 | Turbulence | k-ω SST (Menter 2003), see below |
 
 Every operation is a face or cell loop, so the same code runs on NumPy and CuPy arrays.
+
+With SST enabled, the stored total energy is \(E=e+|\mathbf u|^2/2+k\).
+Temperature and the ideal-gas equation of state use \(e\). The gas HLLC flux
+includes separate contributions for the advection and diffusion of \(k\) and
+the traction and work from the isotropic turbulent pressure \(2\rho k/3\).
+The \(k\) diffusion uses the blended SST coefficient \(\mu+\sigma_k\mu_t\).
+
+For transient cases with `low_mach=true`, the physical step uses implicit Euler
+and the conservative gas Riemann flux. The inner iterations apply the Weiss-Smith
+matrix in pseudo-time with \(Q_p=(p_{\rm eff},\mathbf u,T)\) and frozen \(k\).
+\(U_r\) includes the local velocity, viscous scale \(\mu_{\rm eff}/(\rho\Delta x)\)
+and acoustic cutoff. Use `dual_time_iterations` and `dual_time_tol` to set
+the budget and relative tolerance of the inner iterations.
 
 ## Boundary conditions
 
@@ -42,7 +55,7 @@ Ghost states on boundary faces; Fluent zone types map to these kinds automatical
 The SST model is loosely coupled: after each mean-flow iteration, `k` and `ω` take one implicit
 step with the same local time step, first-order upwind convection from the HLLC mass fluxes,
 central diffusion and point-implicit destruction, relaxed with Jacobi sweeps. Production is
-`μ_t S² − ⅔ρk∇·u`, limited to `10 β* ρkω`; in axisymmetric cases `S` includes the hoop strain
+`μ_t S² − ⅔ρk∇·u`, limited to `10 β* ρkω` in both transport equations; in axisymmetric cases `S` includes the hoop strain
 `v/r`. Walls use the low-Reynolds treatment (`k = 0`, `ω = 60ν/(β₁y²)` in the wall cells), so the
 first cell should sit at y⁺ ≈ 1. Turbulent heat flux uses `Pr_t = 0.85`. Inflow `k` and `ω`
 come from each zone's `turb_intensity` and `turb_visc_ratio`.

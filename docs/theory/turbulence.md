@@ -31,7 +31,7 @@ cross-diffusion term is applied implicitly when it is negative.
 \(\omega_P = \sqrt{\omega_{vis}^2+\omega_{log}^2}\) with
 \(\omega_{vis} = 6\nu/(\beta_1 y^2)\) and \(\omega_{log} = \sqrt{k}/(C_\mu^{1/4}\kappa y)\). The
 wall shear comes from Spalding's law of the wall, solved for \(u_\tau\) by Newton iteration. It
-is exactly laminar for y⁺ < 5 and the log law (κ = 0.41, B = 5.2) for y⁺ > 30, so the model is
+approaches the laminar limit at y⁺ < 5 and the log law (κ = 0.41, E = 9.8) for y⁺ > 30, so the model is
 accurate on wall-resolved meshes and consistent on coarser ones.
 
 ## Realizable k-ε (`k-epsilon-realizable`)

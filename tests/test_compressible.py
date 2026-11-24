@@ -69,6 +69,43 @@ def test_axisymmetric_gas_at_rest_stays_at_rest(turbulence):
     assert np.ptp(f["pressure"]) < 1e-6 * 101325
 
 
+def test_dual_time_low_mach_satisfies_physical_step_and_conserves():
+    from flowtrace.mesh.unstructured import make_periodic
+
+    mesh = make_periodic(make_periodic(cartesian_mesh_2d(8, 4), "left", "right"), "bottom", "top")
+    dt = 1e-4
+    case = CompressibleCase(backend="numpy", time="transient", low_mach=True, dt=dt, t_end=dt)
+    solver = CompressibleSolver(mesh, case)
+    x = solver.cell_centres()[:, 0]
+    solver.initialize(1.2, 0.0, 101325.0 + 10.0 * np.sin(2.0 * np.pi * x))
+    old = solver.Q.copy()
+    initial, _ = solver.residual(old)
+    solver.step()
+    spatial, _ = solver.residual(solver.Q)
+    temporal = (solver.V / dt)[:, None] * (solver.Q - old)
+    assert solver.time == pytest.approx(dt)
+    assert np.max(np.abs(solver.Q[:, 1])) > 1e-5
+    np.testing.assert_array_less(np.max(np.abs(spatial + temporal), axis=0),
+                                  case.dual_time_tol * np.max(np.abs(initial), axis=0) + 2e-12)
+    np.testing.assert_allclose(np.sum(temporal, axis=0), 0.0, atol=1e-6)
+
+
+def test_compressible_sst_total_energy_contains_k():
+    from flowtrace.mesh.unstructured import make_periodic
+
+    mesh = make_periodic(make_periodic(cartesian_mesh_2d(6, 3), "left", "right"), "bottom", "top")
+    solver = CompressibleSolver(mesh, CompressibleCase(turbulence="k-omega-sst", backend="numpy"))
+    x = solver.cell_centres()[:, 0]
+    solver.turb.k[:] = 3.0 + np.sin(2 * np.pi * x)
+    solver.initialize(1.2, [2.0, 0.0], 101325.0)
+    gas_energy = 101325.0 / (solver.gamma - 1.0) + 0.5 * 1.2 * 2.0**2
+    np.testing.assert_allclose(solver.Q[:, -1] - gas_energy, 1.2 * solver.turb.k, atol=1e-10)
+    np.testing.assert_allclose(solver.prim(solver.Q)[:, -1], 101325.0)
+    residual, _ = solver.residual(solver.Q)
+    assert np.max(np.abs(residual[:, 1])) > 0.01  # turbulent-pressure gradient
+    np.testing.assert_allclose(np.sum(residual, axis=0), 0.0, atol=1e-8)
+
+
 def test_native_hllc_matches_array_path():
     from flowtrace import native
 

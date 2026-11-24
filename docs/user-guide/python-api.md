@@ -39,6 +39,37 @@ while not solver.finished:
 print(solver.mass_balance(), solver.heat_flow())
 ```
 
+### Time-dependent momentum forcing
+
+Call `SimpleSolver.set_sources(momentum=force)` before stepping. The function
+`force(centres, time)` receives a read-only NumPy array of cell centres and physical
+time in seconds. Return a finite array with one force vector per cell, per unit volume.
+The solver samples it once per time step at the new physical time, or once at zero
+for a steady run. Closed and periodic cases subtract the volume-weighted mean
+of the sampled callback. Multiply an acceleration field by density to get the required units.
+
+```python
+import numpy as np
+
+from flowtrace.mesh.unstructured import cartesian_mesh_2d, extrude_to_3d
+from flowtrace.unstructured.case import UnstructuredCase
+from flowtrace.unstructured.simple import SimpleSolver
+
+mesh = extrude_to_3d(cartesian_mesh_2d(8, 16), nz=4, lz=1.0)
+case = UnstructuredCase(unsteady=True, dt=0.025, t_end=0.1,
+                        scheme="skew-symmetric", periodic=[["left", "right"], ["bottom", "top"]])
+solver = SimpleSolver(mesh, case)
+
+def force(centres, time):
+    result = np.zeros_like(centres)
+    result[:, 0] = case.density * time * np.sin(2 * np.pi * centres[:, 1])
+    return result
+
+solver.set_sources(momentum=force)
+while not solver.finished:
+    solver.step()
+```
+
 ### Did the iteration really get there? Solver diagnostics
 
 `residuals()` gives Fluent-style scaled residuals. `diagnostics()` says what the latest

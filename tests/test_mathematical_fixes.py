@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 
 from flowtrace.linalg.line_preconditioner import LineImplicitPreconditioner
 from flowtrace.unstructured.simple import NonOrthogonalPressureCorrector
@@ -7,7 +6,6 @@ from flowtrace.compressible.solver import WeissSmithLowMachPreconditioner
 from flowtrace.unstructured.turbulence import (
     spaldings_law_wall_shear,
     linearize_kepsilon_sources,
-    assemble_and_relax_scalar_system,
 )
 from flowtrace.unstructured.certify import compute_gci_certificate
 
@@ -93,14 +91,14 @@ def test_non_orthogonal_pressure_corrector():
         # Solves diag * (p0 - p1) = rhs
         A_val = rho_d_f[0] * corr.alpha_f[0]
         p = np.zeros(2, dtype=np.float64)
-        p[0] = -rhs[0] / (2.0 * A_val)
+        p[0] = rhs[0] / (2.0 * A_val)
         p[1] = -p[0]
         return p
 
     p_prime, grad_p, F_corr = corr.solve_pressure_correction(F_star, rho_d_f, mock_amg)
     assert p_prime.shape == (n_cells,)
     assert grad_p.shape == (n_cells, 3)
-    assert F_corr.shape == (1,)
+    np.testing.assert_allclose(F_corr, 0.0, atol=1e-14)
 
 
 def test_weiss_smith_low_mach_preconditioner():
@@ -127,6 +125,37 @@ def test_weiss_smith_low_mach_preconditioner():
     prec_res = ws.precondition_residual(U, res, beta)
     assert prec_res.shape == (2, 5)
     assert not np.isnan(prec_res).any()
+
+
+def test_weiss_smith_direct_matrix_and_conservative_inverse_with_k():
+    ws = WeissSmithLowMachPreconditioner()
+    rho = np.array([1.25])
+    velocity = np.array([[14.0, -2.0]])
+    temperature = np.array([300.0])
+    k = np.array([80.0])
+    beta = np.array([0.05])
+    R = 287.0
+    cp = ws.gamma * R / ws.gm1
+    effective_pressure = rho * (R * temperature + 2.0 * k / 3.0)
+
+    def conservative(primitive):
+        p, u, T = primitive[:, 0], primitive[:, 1:-1], primitive[:, -1]
+        density = p / (R * T + 2.0 * k / 3.0)
+        energy = (cp - R) * T + 0.5 * np.sum(u**2, axis=1) + k
+        return np.column_stack([density, density[:, None] * u, density * energy])
+
+    primitive = np.column_stack([effective_pressure, velocity, temperature])
+    identity_limit = ws.primitive_matrix(rho, velocity, temperature, R, np.ones_like(beta), k)
+    eps = 1e-4
+    for col, shift in enumerate(eps * np.eye(primitive.shape[1])):
+        numerical = (conservative(primitive + shift) - conservative(primitive - shift)) / (2 * eps)
+        np.testing.assert_allclose(identity_limit[:, :, col], numerical, rtol=1e-6, atol=1e-6)
+
+    gamma = ws.primitive_matrix(rho, velocity, temperature, R, beta, k)
+    residual = np.array([[0.001, -2.0, 1.0, 30.0]])
+    expected = identity_limit[0] @ np.linalg.solve(gamma[0], residual[0])
+    actual = ws.precondition_residual(conservative(primitive), residual, beta, k=k)
+    np.testing.assert_allclose(actual[0], expected, rtol=1e-12, atol=1e-12)
 
 
 def test_spaldings_law_wall_shear():

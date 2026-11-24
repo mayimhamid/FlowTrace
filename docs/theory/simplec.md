@@ -25,13 +25,42 @@ import. For each interior face:
 * **Diffusion:** implicit \(\Gamma_f\alpha(\phi_N-\phi_P)\) plus the explicit non-orthogonal
   correction \(\Gamma_f\,\overline{\nabla\phi}_f\cdot\mathbf T\).
 * **Convection:** implicit first-order upwind with a deferred, bounded second-order upwind
-  correction.
-* **Pressure force in momentum:** Green–Gauss on face pressures,
+  correction are available, as is skew-symmetric momentum convection.
+* **Pressure force in momentum:** the standard Green–Gauss gradient on face pressures,
   \((\nabla p)_P = V_P^{-1}\sum_f p_f\mathbf S_f\), with linearly interpolated, skewness-corrected
-  \(p_f\). This is the discrete adjoint of the face-flux divergence (it is also Fluent's choice).
+  \(p_f\).
   With a least-squares cell gradient instead, the manufactured-solution error stalled at O(1) on
   triangles. That option remains available as `pressure_gradient="least-squares"` for
   comparison.
+
+### Forced momentum and skew-symmetric convection
+
+In the constant-density laminar limit, the momentum equation is
+
+\[
+\rho\left[\partial_t\mathbf u+(\mathbf u\cdot\nabla)\mathbf u\right]
+=-\nabla p+\mu\Delta\mathbf u+\mathbf f_{\mathrm{ext}},
+\qquad \nabla\cdot\mathbf u=0.
+\]
+
+The force per unit volume is \(\rho\mathbf f\) in Equation (1.1) of
+[OpenAI's forced finite-time blowup paper](https://openai.com/index/navier-stokes-solution/).
+The solver samples prescribed forcing at the new physical time for implicit Euler and BDF2.
+For a closed or periodic domain, the callback force is projected to zero volume-weighted mean.
+
+Select `scheme="skew-symmetric"` for centered momentum transport. For each
+interior face, the solver starts with \(F_f(\mathbf u_P+\mathbf u_N)/2\) and subtracts half
+the cell mass imbalance times the local velocity. This leaves \(F_f\mathbf u_N/2\) in
+the owner equation and \(-F_f\mathbf u_P/2\) in the neighbour equation. Their work
+cancels pairwise, even when an intermediate flux has a residual mass imbalance.
+Periodic faces use the same pairing. Physical boundary faces use upwind transport
+with the same half-imbalance subtraction. A bounded upwind term adds dissipation
+where the reconstructed gradient under-resolves a velocity jump.
+
+For turbulent flow, the momentum predictor and Rhie–Chow interpolation use
+\(p_{\rm eff}=p+2\rho k/3\). Exported pressure is \(p\). The transpose and deviatoric
+trace corrections use the effective viscosity on interior faces and open boundaries.
+Wall traction uses the selected wall treatment.
 
 ## Pressure–velocity coupling
 
@@ -50,16 +79,24 @@ AMG-preconditioned CG. pyamg is used on the CPU, and FlowTrace's smoothed-aggreg
 applied with cuSPARSE, on the GPU. The inner tolerance defaults to 0.1, Fluent's AMG default;
 this was measured to leave outer iterations unchanged and save 15–50 % of the wall time.
 
-**Pressure under-relaxation.** SIMPLE uses 0.3. SIMPLEC needs none on orthogonal meshes (1.0).
-The pressure-correction equation keeps only the orthogonal part \(\alpha\) of each face, though,
-and on non-orthogonal meshes the neglected part accumulates. On smoothly warped 96² and 128²
-meshes (24.6° non-orthogonality) SIMPLEC at 1.0 was measured to diverge, while 0.8 converged.
-The default is therefore automatic: 1.0 when the maximum non-orthogonality is ≤ 5°, otherwise
-0.8. This costs 2–6 % more iterations where 1.0 would also have worked, and it follows Fluent's
-own advice to use skewness correction or a more conservative factor on skewed meshes. An
-explicit `relax_p` always takes precedence.
+The transient Rhie-Chow history uses Choi's correction with coefficients
+\((c_1,c_2)=(1,0)\) for implicit Euler and \((2,-1/2)\) for BDF2. BDF2 starts
+with an Euler step to establish the second time level.
 
-## Skewed meshes: measured stability envelope
+The momentum predictor solves the assembled sparse system once. Equivalently,
+the diagonal times the predicted velocity equals the explicit source minus the
+pressure force and minus the off-diagonal matrix applied to the predicted velocity.
+
+Deferred non-orthogonal correctors lag the tangential pressure flux. The final
+face correction uses the same tangential flux as the final Poisson right-hand
+side. Its residual therefore gives the corrected mass imbalance up to roundoff.
+The default is two sweeps above 5 degrees of non-orthogonality and zero otherwise.
+
+**Pressure under-relaxation.** SIMPLE defaults to 0.3. SIMPLEC defaults to 1.0
+through 5 degrees of non-orthogonality and 0.8 above it. An explicit `relax_p`
+takes precedence.
+
+## Stability measurements with orthogonal pressure correction
 
 The pressure-correction equation keeps only the orthogonal part of its Laplacian
 (\(\alpha = \mathbf S\cdot\mathbf S/\mathbf S\cdot\mathbf d\)); the non-orthogonal remainder is
@@ -86,8 +123,7 @@ triangles) tolerate far more: warped triangles at 43° converge at 0.8.
 The stability guard (automatic `relax_p` only) recovered every case in the table. It stops at
 `relax_p` = 0.1, which by the cos² law covers uniform skew up to about 70°. Beyond that, or with
 an explicit `relax_p`, a diverging run now ends with an error naming the mesh non-orthogonality,
-the guard's state and the cos² estimate. Non-orthogonal correctors for the pressure equation (the
-principled fix) are not implemented.
+the guard's state and the cos² estimate. These measurements used zero non-orthogonal corrector sweeps.
 
 ## Residuals and convergence
 

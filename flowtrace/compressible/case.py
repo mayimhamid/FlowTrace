@@ -109,6 +109,8 @@ class CompressibleCase:
     backend: str = "auto"
     precision: str = "fp64"
     monitor_interval: int = 10
+    dual_time_iterations: int = 100
+    dual_time_tol: float = 1e-7
 
     def __post_init__(self):
         self.boundaries = {k: (CompBC(**v) if isinstance(v, dict) else v) for k, v in self.boundaries.items()}
@@ -116,6 +118,10 @@ class CompressibleCase:
             self.gas = GasModel(**self.gas)
         if self.time not in ("steady-implicit", "steady-explicit", "transient"):
             raise ValueError("time must be steady-implicit, steady-explicit or transient")
+        if self.time == "transient" and self.dt is not None and not self.dt > 0.0:
+            raise ValueError("transient dt must be positive")
+        if self.dual_time_iterations < 1 or not 0.0 < self.dual_time_tol < 1.0:
+            raise ValueError("dual-time iterations must be positive and tolerance must lie between zero and one")
         if self.limiter not in ("venkatakrishnan", "barth", "none"):
             raise ValueError("limiter must be venkatakrishnan, barth or none")
         if self.turbulence not in ("laminar", "k-omega-sst"):

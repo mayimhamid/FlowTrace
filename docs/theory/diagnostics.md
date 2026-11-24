@@ -32,7 +32,7 @@ end of the run, so they cost at most about 3 % of the run time.
 | 3. Linear solve returns \(u^*\) | same system | `momentum.<component>.solve`: \(b_r - A_r u^*\), plus the solver's iterations and recurrence residual |
 | 4. Rhie–Chow predictor fluxes \(F^*\) | cell imbalance \(m^*\) | `continuity.predictor` |
 | 5. Pressure correction \(A_p p' = -m^*\) (AMG-PCG) | | `pressure_correction` |
-| 6. Corrected fluxes \(F^{n+1}\) | cell imbalance \(m^* + A_p p'\) = minus the pressure-correction residual | `continuity.corrected` |
+| 6. Corrected fluxes \(F^{n+1}\) | cell imbalance \(m^* + A_p p' - \nabla_h\cdot F_{\rm tan}\) = minus the pressure-correction residual | `continuity.corrected` |
 | 7. \(U^{n+1}\), \(p^{n+1}\) | | `field_change` |
 | 8. Energy (when this solver owns it) | as momentum | `energy.pre_solve`, `energy.solve` |
 

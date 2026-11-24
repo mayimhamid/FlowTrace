@@ -36,6 +36,12 @@ formulation, as Fluent does:
 \qquad \nabla\cdot(\rho\mathbf u) = 0,\qquad \mathbf u_r = \mathbf u - \boldsymbol\Omega\times\mathbf r .
 \]
 
+In the equivalent relative-velocity equation, the inertial source is
+\(-\rho[2\boldsymbol\Omega\times\mathbf u_r+
+\boldsymbol\Omega\times(\boldsymbol\Omega\times\mathbf r)]\).
+The factor of two and the centrifugal term arise when the transported velocity
+is changed from \(\mathbf u\) to \(\mathbf u_r\).
+
 The convecting mass flux is \(F - \rho(\boldsymbol\Omega\times\mathbf r_f)\cdot\mathbf S_f\);
 continuity uses the absolute flux. Walls bounding an MRF zone move with it unless they have their
 own velocity or rotation. An MRF interface should be a surface of revolution, where the frame

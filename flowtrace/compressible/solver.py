@@ -80,42 +80,64 @@ class WeissSmithLowMachPreconditioner:
         u_ref_global: float,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Computes local Weiss-Smith preconditioning parameter beta = (U_r / c)^2."""
+        speed2 = u_vel**2 + v_vel**2 + w_vel**2
         c2 = np.maximum(self.gamma * p / np.maximum(rho, 1e-12), 1e-12)
-        c = np.sqrt(c2)
+        beta = self.reference_beta(np, speed2, c2, rho, mu_eff, dx, u_ref_global)
+        return beta, np.sqrt(c2)
 
-        vel_mag = np.sqrt(u_vel**2 + v_vel**2 + w_vel**2)
-        u_visc = mu_eff / (np.maximum(rho, 1e-12) * np.maximum(dx, 1e-12))
-        u_cut = self.u_cut_ratio * u_ref_global
+    def reference_beta(self, xp, speed2, sound2, rho, mu_eff, dx, u_ref=0.0):
+        """U_r^2/c^2 with viscous and acoustic stagnation cutoffs."""
+        viscous_speed = mu_eff / (rho * dx)
+        floor2 = xp.maximum(1e-5 * sound2, (self.u_cut_ratio * u_ref) ** 2)
+        return xp.minimum(1.0, xp.maximum(xp.maximum(speed2, viscous_speed**2), floor2) / sound2)
 
-        u_r = np.minimum(c, np.maximum(vel_mag, np.maximum(u_visc, u_cut)))
-        beta = (u_r**2) / c2
-        return beta, c
+    def primitive_matrix(self, rho, velocity, temperature, gas_constant, beta, k=0.0):
+        """Direct ideal-gas Weiss-Smith matrix for (p_eff, u, T) with frozen k."""
+        cp = self.gamma * gas_constant / self.gm1
+        effective_rt = gas_constant * temperature + (2.0 / 3.0) * k
+        c2 = self.gamma * effective_rt
+        rho_t = -rho * gas_constant / effective_rt
+        theta = 1.0 / (beta * c2) - rho_t / (rho * cp)
+        enthalpy = cp * temperature + 0.5 * np.sum(velocity**2, axis=1) + (5.0 / 3.0) * k
+        nvar = velocity.shape[1] + 2
+        matrix = np.zeros((len(rho), nvar, nvar), dtype=np.result_type(rho, velocity, temperature, np.float32))
+        matrix[:, 0, 0] = theta
+        matrix[:, 0, -1] = rho_t
+        matrix[:, 1:-1, 0] = theta[:, None] * velocity
+        matrix[:, 1:-1, 1:-1] = rho[:, None, None] * np.eye(nvar - 2)
+        matrix[:, 1:-1, -1] = rho_t[:, None] * velocity
+        matrix[:, -1, 0] = theta * enthalpy - 1.0
+        matrix[:, -1, 1:-1] = rho[:, None] * velocity
+        matrix[:, -1, -1] = rho_t * enthalpy + rho * cp
+        return matrix
 
     def precondition_residual(
         self,
         U: np.ndarray,
         residual: np.ndarray,
         beta: np.ndarray,
+        *, xp=np, k=None,
     ) -> np.ndarray:
         """
-        Applies Gamma_U^{-1} = I - (1 - beta) * q * r^T to the conservative residual.
+        Applies (dU/dQ_p) Gamma_U^{-1} to the conservative residual.
         U, residual have shape (n_cells, nvar): [rho, rho*u..., rho*E].
         """
         dim = U.shape[1] - 2
         rho = U[:, 0]
-        inv_rho = 1.0 / np.maximum(rho, 1e-12)
+        inv_rho = 1.0 / xp.maximum(rho, 1e-12)
         u = U[:, 1:1 + dim] * inv_rho[:, None]
         E = U[:, -1] * inv_rho
 
-        ke = 0.5 * np.sum(u * u, axis=1)
-        p = self.gm1 * rho * (E - ke)
-        c2 = self.gamma * p * inv_rho
-        H = E + p * inv_rho
+        ke = 0.5 * xp.sum(u * u, axis=1)
+        k = 0.0 if k is None else k
+        p_eff_over_rho = self.gm1 * (E - ke - k) + (2.0 / 3.0) * k
+        c2 = self.gamma * p_eff_over_rho
+        H = E + p_eff_over_rho
 
-        coeff = self.gm1 / np.maximum(c2, 1e-12)
+        coeff = self.gm1 / xp.maximum(c2, 1e-12)
         r_dot_res = coeff * (
-            ke * residual[:, 0]
-            - np.sum(u * residual[:, 1:1 + dim], axis=1)
+            (ke - k + (2.0 / (3.0 * self.gm1)) * k) * residual[:, 0]
+            - xp.sum(u * residual[:, 1:1 + dim], axis=1)
             + residual[:, -1]
         )
 
@@ -172,6 +194,7 @@ class CompressibleSolver:
         W[:, 0] = case.init_p / (self.R * case.init_T)
         W[:, 1:1 + dim] = u0
         W[:, -1] = case.init_p
+        self.turb = None
         self.Q = self.cons(xp.asarray(W, dtype=self.dtype))
         self.iteration = 0
         self.time = 0.0
@@ -185,11 +208,11 @@ class CompressibleSolver:
         self.mdot_i = xp.zeros(fv.P.shape[0], dtype=self.dtype)
         self.mdot_b = xp.zeros(fv.n_bf, dtype=self.dtype)
         self.W_last = self.prim(self.Q)
-        self.turb = None
         if case.turbulence == "k-omega-sst":
             from .sst import CompressibleSST
 
             self.turb = CompressibleSST(self)
+            self.Q[:, -1] += self.Q[:, 0] * self.turb.k
         self.setup_seconds = time.perf_counter() - t0
 
     def initialize(self, rho, velocity, p) -> None:
@@ -202,17 +225,20 @@ class CompressibleSolver:
         self.Q = self.cons(xp.asarray(W, dtype=self.dtype))
 
     # ------------------------------------------------------------------ state conversion
-    def prim(self, Q):
+    def prim(self, Q, k=None):
         xp, g, d = self.xp, self.gamma, self.dim
         rho = Q[:, 0]
         u = Q[:, 1:1 + d] / rho[:, None]
-        p = (g - 1.0) * (Q[:, -1] - 0.5 * rho * xp.sum(u * u, axis=1))
+        if k is None:
+            k = self.turb.k if self.turb is not None else 0.0
+        p = (g - 1.0) * (Q[:, -1] - rho * (0.5 * xp.sum(u * u, axis=1) + k))
         return xp.concatenate([rho[:, None], u, p[:, None]], axis=1)
 
     def cons(self, W):
         xp, g, d = self.xp, self.gamma, self.dim
         rho, u, p = W[:, 0], W[:, 1:1 + d], W[:, -1]
-        E = p / (g - 1.0) + 0.5 * rho * xp.sum(u * u, axis=1)
+        k = self.turb.k if self.turb is not None else 0.0
+        E = p / (g - 1.0) + rho * (0.5 * xp.sum(u * u, axis=1) + k)
         return xp.concatenate([rho[:, None], rho[:, None] * u, E[:, None]], axis=1)
 
     # ------------------------------------------------------------------ boundaries
@@ -344,7 +370,7 @@ class CompressibleSolver:
         return xp.concatenate([(rho * un)[:, None], rho[:, None] * u * un[:, None] + p[:, None] * n,
                                ((E + p) * un)[:, None]], axis=1)
 
-    def _hllc(self, WL, WR, n):
+    def _hllc(self, WL, WR, n, beta=None):
         """HLLC flux per unit area (Toro 2009, ch. 10) with Einfeldt / Roe wave-speed estimates."""
         xp, g, d = self.xp, self.gamma, self.dim
         rL, uL, pL = WL[:, 0], WL[:, 1:1 + d], WL[:, -1]
@@ -359,11 +385,12 @@ class CompressibleSolver:
         H_roe = w * (EL + pL) / rL + (1.0 - w) * (ER + pR) / rR
         c_roe = xp.sqrt(xp.maximum((g - 1.0) * (H_roe - 0.5 * xp.sum(u_roe * u_roe, axis=1)), 1e-30))
         un_roe = xp.sum(u_roe * n, axis=1)
-        if self.low_mach:
-            velL = xp.sqrt(xp.sum(uL * uL, axis=1))
-            velR = xp.sqrt(xp.sum(uR * uR, axis=1))
-            beta_L = xp.clip((velL / xp.maximum(cL, 1e-12))**2, 1e-4, 1.0)
-            beta_R = xp.clip((velR / xp.maximum(cR, 1e-12))**2, 1e-4, 1.0)
+        if self.low_mach and self.case.time != "transient":
+            if beta is None:
+                beta_L = xp.clip(xp.sum(uL**2, axis=1) / cL**2, 1e-5, 1.0)
+                beta_R = xp.clip(xp.sum(uR**2, axis=1) / cR**2, 1e-5, 1.0)
+            else:
+                beta_L, beta_R = beta
             beta_roe = xp.maximum(beta_L, beta_R)
 
             unL_p = 0.5 * (1.0 + beta_L) * unL
@@ -400,7 +427,7 @@ class CompressibleSolver:
 
     def _pick_flux_kernel(self) -> str:
         """native C++/OpenMP (NumPy, FP64), CUDA (CuPy, FP64) or the vectorised array code."""
-        if getattr(self, "low_mach", False):
+        if self.low_mach and self.case.time != "transient":
             return "array"
         if self.dtype != np.float64:
             return "array"
@@ -412,7 +439,7 @@ class CompressibleSolver:
 
         return "native-cuda" if cuda.available() else "array"
 
-    def _flux(self, WL, WR, n, A):
+    def _flux(self, WL, WR, n, A, beta=None):
         """HLLC flux times the face areas, on the fastest available kernel."""
         if self.flux_kernel == "native-cpu":
             from .. import native
@@ -422,7 +449,7 @@ class CompressibleSolver:
             from ..native import cuda
 
             return cuda.hllc_flux(WL, WR, n, A, self.gamma)
-        return self._hllc(WL, WR, n) * A[:, None]
+        return self._hllc(WL, WR, n, beta) * A[:, None]
 
     def _viscosity(self, T):
         g = self.case.gas
@@ -501,17 +528,38 @@ class CompressibleSolver:
             Wgb = self._ghost(WbL)
         else:
             WL, WR, WbL, Wgb = W[P], W[N], WP_b, Wg
-        F = self._flux(WL, WR, self.n_i, self.A_i)
-        Fb = self._flux(WbL, Wgb, self.n_b, self.A_b)
+        beta_i = beta_b = None
+        if self.low_mach and self.case.time != "transient":
+            beta = self._low_mach_beta(W)
+            beta_i, beta_b = (beta[P], beta[N]), (beta[Pb], beta[Pb])
+        F = self._flux(WL, WR, self.n_i, self.A_i, beta_i)
+        Fb = self._flux(WbL, Wgb, self.n_b, self.A_b, beta_b)
         self.mdot_i, self.mdot_b, self.grad_last, self.W_last = F[:, 0], Fb[:, 0], grad, W
         if self.case.viscous:
             Fv, Fvb = self._viscous_fluxes(W, grad, Wface_b, WP_b, Wg)
             F = F - Fv * self.A_i[:, None]
             Fb = Fb - Fvb * self.A_b[:, None]
+        if self.turb is not None:
+            k = self.turb.k
+            kb = self.turb._face_values(k, self.turb.k_in, 0.0)
+            F[:, -1] += self.mdot_i * xp.where(self.mdot_i >= 0, k[P], k[N])
+            Fb[:, -1] += self.mdot_b * xp.where(self.mdot_b >= 0, k[Pb], kb)
+            # The gas HLLC flux uses thermodynamic pressure. Add the
+            # isotropic turbulent traction and its work once, per face.
+            p_t = (WL[:, 0] * k[P] + WR[:, 0] * k[N]) / 3.0
+            p_tb = (2.0 / 3.0) * Wface_b[:, 0] * kb
+            self._add_pressure_flux(F, p_t, WL, WR, self.n_i, self.A_i)
+            self._add_pressure_flux(Fb, p_tb, WbL, Wgb, self.n_b, self.A_b)
+            dk, dkb = self.turb.k_diffusion(W, kb)
+            F[:, -1] -= dk
+            # An adiabatic wall has zero total diffusive energy flux.
+            Fb[:, -1] -= xp.where(self.turb.wall_b & ~self.is_iso, 0.0, dkb)
         R = fv.Cdiff_d @ F + fv.Cb_d @ Fb
         if self.case.axisymmetric:
             # pressure (and hoop stress) on the two wedge faces: a radial source per radian
             src = W[:, -1]
+            if self.turb is not None:
+                src = src + (2.0 / 3.0) * W[:, 0] * self.turb.k
             if self.case.viscous:
                 T = W[:, -1] / (W[:, 0] * self.R)
                 mu = self._viscosity(T) + (self.turb.mut if self.turb is not None else 0.0)
@@ -520,6 +568,11 @@ class CompressibleSolver:
                 src = src - 2.0 * mu * (W[:, 2] / r - div / 3.0)
             R[:, 2] = R[:, 2] - src * self.vol_planar
         return R, W
+
+    def _add_pressure_flux(self, flux, pressure, left, right, normal, area):
+        traction = (pressure * area)[:, None] * normal
+        flux[:, 1:-1] += traction
+        flux[:, -1] += 0.5 * self.xp.sum(traction * (left[:, 1:-1] + right[:, 1:-1]), axis=1)
 
     def _viscous_fluxes(self, W, grad, Wface_b, WP_b, Wg):
         """Viscous flux tau.n and energy flux (tau.u + k grad T).n per unit area."""
@@ -580,6 +633,18 @@ class CompressibleSolver:
         return xp.concatenate([zero[:, None], tn, en[:, None]], axis=1)
 
     # ------------------------------------------------------------------ time step
+    def _low_mach_beta(self, W):
+        xp = self.xp
+        rho, p = W[:, 0], W[:, -1]
+        speed2 = xp.sum(W[:, 1:-1]**2, axis=1)
+        mu_eff = 0.0
+        if self.case.viscous:
+            mu_eff = self._viscosity(p / (rho * self.R))
+            if self.turb is not None:
+                mu_eff = mu_eff + self.turb.mut
+                p = p + (2.0 / 3.0) * rho * self.turb.k
+        return self.preconditioner.reference_beta(xp, speed2, self.gamma * p / rho, rho, mu_eff, self.h, xp.sqrt(xp.max(speed2)))
+
     def _spectral(self, W):
         """Face spectral radii (|u.n| + c) A (+ viscous part) on interior and boundary faces."""
         xp, fv, g, d = self.xp, self.fv, self.gamma, self.dim
@@ -587,9 +652,9 @@ class CompressibleSolver:
         c = xp.sqrt(g * W[:, -1] / W[:, 0])
         un_P = xp.abs(xp.sum(W[P, 1:1 + d] * self.n_i, axis=1))
         un_N = xp.abs(xp.sum(W[N, 1:1 + d] * self.n_i, axis=1))
-        if self.low_mach:
+        if self.low_mach and self.case.time != "transient":
             vel = xp.sqrt(xp.sum(W[:, 1:1 + d] ** 2, axis=1))
-            beta = xp.clip((vel / xp.maximum(c, 1e-12))**2, 1e-4, 1.0)
+            beta = self._low_mach_beta(W)
             eff_c = 0.5 * xp.sqrt(((1.0 - beta) * vel) ** 2 + 4.0 * beta * c**2)
         else:
             eff_c = c
@@ -639,8 +704,12 @@ class CompressibleSolver:
             return
         c = self.case
         t0 = time.perf_counter()
+        time_old = self.time
         if c.time == "transient":
-            self._step_rk3(global_dt=True)
+            if self.low_mach:
+                self._step_dual_time()
+            else:
+                self._step_rk3(global_dt=True)
         elif c.time == "steady-explicit":
             self._step_rk3(global_dt=False)
         else:
@@ -649,8 +718,9 @@ class CompressibleSolver:
             W = self.prim(self.Q)
             dt, _, _, _ = self._local_dt(W, self.cfl)
             if c.time == "transient":
-                dt = self.xp.full(self.nc, float(self.xp.min(dt)) if c.dt is None else float(c.dt), dtype=self.dtype)
-            self._last_turb = self.turb.update(self.W_last, self.grad_last, dt)
+                dt = self.xp.full(self.nc, self.time - time_old, dtype=self.dtype)
+            k_max = self.turb.k + (1.0 - 1e-6) * W[:, -1] / ((self.gamma - 1.0) * W[:, 0])
+            self._last_turb = self.turb.update(self.W_last, self.grad_last, dt, k_max)
         self.timers["iteration"] += time.perf_counter() - t0
         self.iteration += 1
 
@@ -673,12 +743,42 @@ class CompressibleSolver:
         if global_dt:
             self.time += float(dt[0])
 
+    def _step_dual_time(self):
+        """Implicit Euler in physical time, Weiss-Smith in pseudo-time."""
+        xp, c = self.xp, self.case
+        old = self.Q
+        residual, W = self.residual(old)
+        dt_limit, _, _, spectral = self._local_dt(W, c.cfl)
+        dt = float(xp.min(dt_limit)) if c.dt is None else float(c.dt)
+        dt = min(dt, c.t_end - self.time) if c.t_end else dt
+        physical_diagonal = self.V / dt
+        reference = xp.max(xp.abs(residual), axis=0)
+        state_scale = xp.abs(old)
+        acoustic_momentum = xp.sqrt(self.gamma * W[:, 0] * W[:, -1])
+        state_scale[:, 1:-1] = xp.maximum(state_scale[:, 1:-1], acoustic_momentum[:, None])
+        roundoff = 8.0 * np.finfo(self.dtype).eps * xp.max((physical_diagonal + spectral)[:, None] * state_scale, axis=0)
+        target = c.dual_time_tol * reference + roundoff
+        try:
+            for iteration in range(c.dual_time_iterations + 1):
+                rhs = residual + physical_diagonal[:, None] * (self.Q - old)
+                if bool(xp.all(xp.max(xp.abs(rhs), axis=0) <= target)):
+                    break
+                if iteration == c.dual_time_iterations:
+                    raise RuntimeError(f"dual-time residual did not reach tolerance in {iteration} iterations "
+                                       f"at t={self.time + dt:g}, dt={dt:g}")
+                self._implicit_update(rhs, W, physical_diagonal)
+                residual, W = self.residual(self.Q)
+        except Exception:
+            self.Q = old
+            self.residual(old)
+            raise
+        self._record(residual)
+        self.time += dt
+
     def _step_implicit(self):
         """Implicit Euler, first-order Rusanov Jacobian, Jacobi sweeps (matrix-free)."""
-        fv, c = self.fv, self.case
-        P, N = fv.P, fv.N
-        Q = self.Q
-        R, W = self.residual(Q)
+        c = self.case
+        R, W = self.residual(self.Q)
         rmax = self._record(R)
         # CFL ramp: grow while the residual falls, back off when it rises
         if rmax < self._prev_rmax:
@@ -686,8 +786,21 @@ class CompressibleSolver:
         elif rmax > 1.5 * self._prev_rmax:
             self.cfl = max(c.cfl, 0.5 * self.cfl)
         self._prev_rmax = rmax
-        dt, lam, lamb, Lc = self._local_dt(W, self.cfl)
-        D = self.V / dt + 0.5 * Lc
+        self._implicit_update(R, W)
+
+    def _implicit_update(self, R, W, physical_diagonal=None):
+        fv, c = self.fv, self.case
+        P, N = fv.P, fv.N
+        Q = self.Q
+        dt, lam, _, Lc = self._local_dt(W, self.cfl)
+        pseudo_diagonal = self.V / dt
+        beta = self._low_mach_beta(W) if self.low_mach else None
+        D = pseudo_diagonal + 0.5 * Lc
+        if physical_diagonal is not None:
+            # Increase the implicit pseudo step as beta decreases to keep
+            # the pressure update from stalling against the physical term.
+            pseudo_diagonal = pseudo_diagonal * beta
+            D = pseudo_diagonal + physical_diagonal + 0.5 * Lc
         axi = c.axisymmetric
         if axi:
             # The radius-weighted face areas of a cell do not sum to zero: sum_f n_y A_f = planar area.
@@ -703,7 +816,13 @@ class CompressibleSolver:
             p0c = W[:, -1]
             cs = xp.sqrt(self.gamma * W[:, -1] / W[:, 0])
             D = D + (xp.sqrt(xp.sum(W[:, 1:1 + self.dim] ** 2, axis=1)) + cs) * self.vol_planar
-        dQ = -R / D[:, None]
+        k = self.turb.k if self.turb is not None else None
+        if beta is not None:
+            # Invert V/dt (Gamma dQ_p/dU) + 0.5 Lc I in conservative variables.
+            diagonal_beta = beta * D / (pseudo_diagonal + (D - pseudo_diagonal) * beta)
+            dQ = -self.preconditioner.precondition_residual(Q, R, diagonal_beta, xp=self.xp, k=k) / D[:, None]
+        else:
+            dQ = -R / D[:, None]
         n = self.n_i
         A = self.A_i[:, None]
         WP, WN = W[P], W[N]
@@ -711,8 +830,8 @@ class CompressibleSolver:
         lamA = lam[:, None]
         for _ in range(c.jacobi_sweeps):
             dQP, dQN = dQ[P], dQ[N]
-            WPn = self.prim(Q[P] + dQP)
-            WNn = self.prim(Q[N] + dQN)
+            WPn = self.prim(Q[P] + dQP, None if k is None else k[P])
+            WNn = self.prim(Q[N] + dQN, None if k is None else k[N])
             dFN = self._euler_flux(WNn, n) - FN0
             dFP = self._euler_flux(WPn, n) - FP0
             offP = 0.5 * (dFN * A - lamA * dQN)  # neighbour N in P's row (normal out of P)
@@ -723,6 +842,8 @@ class CompressibleSolver:
                 own = 0.5 * (self._euler_flux(Wn, ey) - FY0) * vp
                 own[:, 2] -= (Wn[:, -1] - p0c) * self.vol_planar
                 rhs = rhs - own
+            if beta is not None:
+                rhs = self.preconditioner.precondition_residual(Q, rhs, diagonal_beta, xp=self.xp, k=k)
             dQ = rhs / D[:, None]
         self.Q = Q + self._positive(Q, dQ)
 

@@ -16,7 +16,7 @@ def test_spalding_law_limits():
     up = spalding_uplus(re_y)
     yp = re_y / up
     assert np.allclose(up[:2], np.sqrt(re_y[:2]), rtol=2e-3)  # viscous sublayer: u+ = y+
-    loglaw = np.log(yp[-2:]) / KAPPA + 5.2
+    loglaw = np.log(9.8 * yp[-2:]) / KAPPA
     assert np.allclose(up[-2:], loglaw, rtol=2e-3)
     assert spalding_uplus(np.array([0.0]))[0] == 0.0
 

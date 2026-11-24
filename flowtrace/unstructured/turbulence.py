@@ -48,13 +48,14 @@ from typing import Dict, Optional
 
 import numpy as np
 
-KAPPA = 0.41  # von Karman constant of the SST model (Menter) and of Spalding's law (with B = 5.2)
+KAPPA = 0.41  # von Karman constant in SST and Spalding's wall law
 # Fluent's standard / scalable wall functions pair E = 9.793 with kappa = 0.4187 (log-law intercept
 # B = ln(E)/kappa = 5.45). Combined with 0.41, E = 9.793 gives B = 5.57 and under-predicts the wall
 # shear (measured: flat plate Cf -2 %, channel U+ up to +1.7 % against DNS).
 KAPPA_WALL = 0.4187
 E_WALL = 9.793
-B_SPALDING = 5.2
+E_SPALDING = 9.8
+B_SPALDING = math.log(E_SPALDING) / KAPPA
 CMU = 0.09
 YSTAR_LIM = 11.225
 PR_T = 0.85  # turbulent Prandtl number (energy)
@@ -62,27 +63,23 @@ PR_T = 0.85  # turbulent Prandtl number (energy)
 MODELS = ("laminar", "k-omega-sst", "k-epsilon-realizable", "k-epsilon-standard")
 
 
-def spalding_uplus(re_y: np.ndarray, iters: int = 30) -> np.ndarray:
-    """Solve Spalding's law for u+ given Re_y = U_t y / nu (vectorised Newton).
-
-    Spalding (1961): y+ = u+ + e^{-kB} (e^{k u+} - 1 - k u+ - (k u+)^2/2 - (k u+)^3/6),
-    with y+ = Re_y / u+ for the unknown friction velocity.
-    """
+def spalding_uplus(re_y: np.ndarray, iters: int = 30, *,
+                   kappa: float = KAPPA, B: float = B_SPALDING, tol: float = 1e-10) -> np.ndarray:
+    """Solve u+ y+(u+) = Re_y for the Spalding wall law."""
     re_y = np.maximum(np.asarray(re_y, dtype=float), 0.0)
-    k, eb = KAPPA, math.exp(-KAPPA * B_SPALDING)
-    # start from the laminar or the log-law estimate
-    up = np.where(re_y < 120.0, np.sqrt(np.maximum(re_y, 1e-300)),
-                  np.log(np.maximum(E_WALL * np.sqrt(np.maximum(re_y, 1.0)), 1.0)) / k + 1.0)
+    eb = math.exp(-kappa * B)
+    up = np.minimum(np.sqrt(re_y), np.log1p(re_y) / kappa + B)
+    up = np.where(re_y > 0, up, 1.0)
     for _ in range(iters):
-        ku = np.minimum(k * up, 60.0)
-        ex = np.exp(ku)
-        g = up + eb * (ex - 1 - ku - ku ** 2 / 2 - ku ** 3 / 6)  # y+(u+)
-        dg = 1 + eb * k * (ex - 1 - ku - ku ** 2 / 2)
-        f = re_y / np.maximum(up, 1e-300) - g
-        df = -re_y / np.maximum(up, 1e-300) ** 2 - dg
-        step = f / df
-        up = np.maximum(up - step, 0.5 * up)
-        if np.all(np.abs(step) <= 1e-10 * np.maximum(up, 1e-12)):
+        ku = kappa * up
+        exp_neg = np.exp(-ku)
+        tail = -np.expm1(-ku) - exp_neg * (ku + ku**2 / 2)
+        yp_scaled = up * exp_neg + eb * (tail - exp_neg * ku**3 / 6)
+        dyp_scaled = exp_neg + kappa * eb * tail
+        # Scale g and its analytic derivative by exp(-kappa u+)/u+.
+        step = (yp_scaled - (re_y * exp_neg) / up) / (yp_scaled / up + dyp_scaled)
+        up = np.where(re_y > 0, np.maximum(up - step, 0.5 * up), up)
+        if np.all((re_y == 0) | (np.abs(step) <= tol * up)):
             break
     return np.where(re_y > 0, up, 0.0)
 
@@ -92,9 +89,9 @@ def spaldings_law_wall_shear(
     y_wall: np.ndarray,
     rho: np.ndarray,
     nu: np.ndarray,
-    kappa: float = 0.41,
-    B: float = 5.2,
-    max_iter: int = 12,
+    kappa: float = KAPPA,
+    B: float = B_SPALDING,
+    max_iter: int = 30,
     tol: float = 1e-13,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -110,33 +107,11 @@ def spaldings_law_wall_shear(
     y_plus : (n_wall_faces,) ndarray
         Dimensionless wall distance.
     """
-    u_mag = np.maximum(np.abs(u_tan), 1e-15)
-    Re_y = (u_mag * y_wall) / np.maximum(nu, 1e-15)
-
-    u_plus = np.minimum(np.sqrt(Re_y), (1.0 / kappa) * np.log1p(kappa * Re_y) + B)
-    u_plus = np.maximum(u_plus, 1e-12)
-
-    exp_neg_kB = np.exp(-kappa * B)
-
-    for _ in range(max_iter):
-        ku = kappa * u_plus
-        exp_ku = np.exp(np.minimum(ku, 50.0))
-        poly = 1.0 + ku + 0.5 * ku**2 + (1.0 / 6.0) * ku**3
-        dpoly = 1.0 + ku + 0.5 * ku**2
-
-        f_spald = u_plus + exp_neg_kB * (exp_ku - poly)
-        df_spald = 1.0 + kappa * exp_neg_kB * (exp_ku - dpoly)
-
-        g = u_plus * f_spald - Re_y
-        dg = f_spald + u_plus * df_spald
-
-        du = g / dg
-        u_plus -= du
-        if np.max(np.abs(du)) < tol:
-            break
-
-    u_tau = u_mag / u_plus
-    y_plus = (y_wall * u_tau) / np.maximum(nu, 1e-15)
+    u_mag = np.abs(np.asarray(u_tan, dtype=float))
+    nu = np.maximum(nu, 1e-15)
+    u_plus = spalding_uplus(u_mag * y_wall / nu, max_iter, kappa=kappa, B=B, tol=tol)
+    u_tau = np.divide(u_mag, u_plus, out=np.zeros_like(u_plus), where=u_plus > 0)
+    y_plus = y_wall * u_tau / nu
     tau_w = rho * (u_tau**2)
     return tau_w, u_tau, y_plus
 
@@ -374,18 +349,26 @@ class TurbulenceModel:
     def energy_diffusivity(self, k_over_cp: float):
         fv = self.s.fv
         mut_f = fv.face_interp(self.mut)
-        gb = k_over_cp + self.xp.where(self.xp.asarray(self.wall_b), 0.0, self.mut[fv.Pb] / PR_T)
-        return k_over_cp + mut_f / PR_T, gb
+        pr_t = self.s.case.prandtl_turbulent
+        gb = k_over_cp + self.xp.where(self.xp.asarray(self.wall_b), 0.0, self.mut[fv.Pb] / pr_t)
+        return k_over_cp + mut_f / pr_t, gb
 
-    def transpose_stress(self, gU):
-        """Explicit div(mu_t (grad U)^T) per cell (the part not in the Laplacian)."""
+    def transpose_stress(self, gU, viscosity):
+        """Explicit transpose and trace terms in the symmetric deviatoric stress."""
         s, xp = self.s, self.xp
         fv, dim = s.fv, s.dim
-        mut_f = fv.face_interp(self.mut)
+        mu_f, mu_b = viscosity
+        div_u = sum(gU[j][:, j] for j in range(dim))
+        div_f = fv.face_interp(div_u)
+        # Wall functions prescribe wall traction. Apply the correction on
+        # interior faces and open boundaries.
+        mu_b = mu_b * (s.m_inlet + s.m_pres)
         out = xp.zeros((s.nc, dim), dtype=s.dtype)
         for k in range(dim):
-            gT = xp.stack([gU[j][:, k] for j in range(dim)], axis=1)  # d u_j / d x_k
-            out[:, k] = fv.Cdiff_d @ (mut_f * xp.sum(fv.face_interp_vec(gT) * fv.S, axis=1))
+            gT = xp.stack([gU[j][:, k] for j in range(dim)], axis=1)
+            interior = xp.sum(fv.face_interp_vec(gT) * fv.S, axis=1) - (2.0 / 3.0) * div_f * fv.S[:, k]
+            boundary = xp.sum(gT[fv.Pb] * fv.Sb, axis=1) - (2.0 / 3.0) * div_u[fv.Pb] * fv.Sb[:, k]
+            out[:, k] = fv.Cdiff_d @ (mu_f * interior) + fv.Cb_d @ (mu_b * boundary)
         return out
 
     # ------------------------------------------------------------------
@@ -552,12 +535,15 @@ class KOmegaSST(TurbulenceModel):
         F1, F2, kw = self._blend()
         rho, k, w = self.rho, self.k, self.w
         bl = lambda a, b: F1 * a + (1.0 - F1) * b  # noqa: E731
-        Pk = self.mut * S2
-        Pk = xp.minimum(Pk, 10.0 * self.bstar * rho * k * w)
+        limit = 10.0 * self.bstar * rho * k * w
+        Pk = xp.minimum(self.mut * S2, limit)
         knew, rk = self._transport(k, self.kb_in, bl(self.sk1, self.sk2), Pk, self.bstar * rho * w,
                                    self.relax_k, floor=self.k_min, name="k")
         cdt = (1.0 - F1) * 2.0 * rho * self.sw2 * kw / w
-        Sc = bl(self.g1, self.g2) * rho * S2 + xp.maximum(cdt, 0.0)
+        # Pk / nu_t with the small-eddy-viscosity limit taken algebraically.
+        limited_strain = xp.divide(Pk, xp.where(self.mut > 0.0, self.mut, 1.0))
+        limited_strain = xp.where(self.mut > 0.0, limited_strain, S2)
+        Sc = bl(self.g1, self.g2) * rho * limited_strain + xp.maximum(cdt, 0.0)
         Sp = bl(self.b1, self.b2) * rho * w + xp.maximum(-cdt, 0.0) / w
         wnew, rw = self._transport(w, self.sb_in, bl(self.sw1, self.sw2), Sc, Sp, self.relax_w,
                                    fixed_cells=self.wall_cells, fixed_vals=self._omega_wall(), floor=self.w_min, name="w")
@@ -580,7 +566,16 @@ class KEpsilonRealizable(TurbulenceModel):
 
     def _cmu(self, gU):
         xp = self.xp
-        S, W, S2, W2, S3 = strain_invariants(xp, gU, self.s.dim)
+        dim = self.s.dim
+        S, _, S2, W2, S3 = strain_invariants(xp, gU, dim)
+        frame = self.s.mrf_omega_cells
+        if frame is not None:
+            # The solver stores absolute velocity, so its antisymmetric
+            # gradient is Omega_ij. Apply -2 epsilon_ijk Omega_frame,k
+            # to its three independent components.
+            pairs = ((1, 0, 2),) if dim == 2 else ((2, 1, 0), (0, 2, 1), (1, 0, 2))
+            W2 = 2.0 * sum((0.5 * (gU[i][:, j] - gU[j][:, i]) + 2.0 * frame[:, axis])**2
+                           for i, j, axis in pairs)
         St = xp.sqrt(S2)
         Wr = xp.where(St > 0, S3 / xp.maximum(St ** 3, 1e-300), 0.0)
         phi = xp.arccos(xp.clip(math.sqrt(6.0) * Wr, -1.0, 1.0)) / 3.0

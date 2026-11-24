@@ -21,6 +21,7 @@ window.FT_I18N = {
     pSolver: "Pressure solver", autotuned: "Auto-tuned", spectral: "Spectral (DCT/DST/FFT)", gemm: "Dense diagonalisation (GEMM)",
     mg: "Multigrid-PCG", fmg: "FMG grid sequencing", pbSolver: "Pressure-based solver", scheme: "Scheme",
     momDisc: "Momentum discretisation", so: "Second-order upwind", relaxU: "Relaxation: momentum", relaxP: "Relaxation: pressure",
+    skewSymmetric: "Skew-symmetric central",
     maxIter: "Max iterations", resTarget: "Residual target", execution: "Execution", backend: "Backend",
     autoBackend: "Auto (measure & choose)", precision: "Precision", auto: "Auto", ckpt: "Checkpoint every (s)",
     estimate: "Estimate memory", target: "Target system", throughput: "Measured throughput", runBench: "Run benchmark",

@@ -42,13 +42,13 @@ def test_stretch_and_split_and_periodic_match():
 def test_spalding_law_limits():
     xp = np
     nu = 1e-5
-    y = np.array([1e-6, 1e-3])
+    y = np.array([1e-6, 1e-2])
     # viscous sublayer: u+ = y+  -> utau^2 = nu ut / y
     ut = np.array([0.01, 10.0])
     utau = spalding_utau(xp, ut, y, nu)
     assert np.isclose(utau[0] ** 2, nu * ut[0] / y[0], rtol=1e-3)
     yp, up = y[1] * utau[1] / nu, ut[1] / utau[1]
-    assert yp > 30 and np.isclose(up, np.log(yp) / 0.41 + 5.2, rtol=0.02)
+    assert yp > 30 and np.isclose(up, np.log(9.8 * yp) / 0.41, rtol=0.02)
 
 
 # ---------------------------------------------------------------- periodic + transient

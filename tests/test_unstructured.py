@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from scipy.interpolate import griddata
 
 from flowtrace.hardware.backend import get_backend
@@ -14,6 +15,93 @@ def run(s):
     while not s.finished:
         s.step()
     return s
+
+
+def test_skew_symmetric_momentum_does_no_internal_work():
+    mesh = cartesian_mesh_2d(5, 4, triangulate=True, jitter=0.15)
+    solver = SimpleSolver(mesh, UnstructuredCase(scheme="skew-symmetric"), be)
+    fv = solver.fv
+    rng = np.random.default_rng(42)
+    flux = rng.normal(size=fv.n_if)
+    boundary_flux = np.zeros(fv.n_bf)
+    assert np.linalg.norm(fv.net_outflow(flux, boundary_flux)) > 0.1
+    diag, a_pn, a_np, _ = solver._coefficients(
+        0.0, solver.m_dirvel, (flux, boundary_flux), skew_symmetric=True
+    )
+    operator = fv.matrix(diag, a_pn, a_np)
+    velocity = rng.normal(size=(solver.nc, solver.dim))
+    np.testing.assert_allclose(operator.toarray(), -operator.toarray().T, atol=1e-14)
+    assert abs(np.sum(velocity * (operator @ velocity))) < 1e-13
+
+    smooth_velocity = solver.cell_centres()
+    linear_gradients = [np.broadcast_to(row, smooth_velocity.shape) for row in np.eye(solver.dim)]
+    np.testing.assert_allclose(solver._skew_upwind_diffusion(smooth_velocity, linear_gradients, flux), 0.0)
+
+    unresolved_gradients = [np.zeros_like(velocity) for _ in range(solver.dim)]
+    diffusion = solver._skew_upwind_diffusion(velocity, unresolved_gradients, flux)
+    diag, a_pn, a_np, _ = solver._coefficients(
+        0.0, solver.m_dirvel, (flux, boundary_flux), skew_symmetric=True, upwind_diffusion=diffusion
+    )
+    dissipative_operator = fv.matrix(diag, a_pn, a_np)
+    actual = np.sum(velocity * (dissipative_operator @ velocity))
+    expected = np.sum(diffusion * np.sum((velocity[fv.N] - velocity[fv.P])**2, axis=1))
+    assert actual == pytest.approx(expected)
+    assert actual > 0.0
+
+
+@pytest.mark.parametrize("time_scheme", ["euler", "bdf2"])
+def test_transient_momentum_forcing_from_rest_in_3d(time_scheme):
+    ny, nz = 8, 4
+    mesh = extrude_to_3d(cartesian_mesh_2d(3, ny), nz, 1.0)
+    rho, nu, dt = 2.5, 0.04, 0.025
+    case = UnstructuredCase(
+        scheme="skew-symmetric", density=rho, viscosity=rho * nu,
+        periodic=[["left", "right"], ["bottom", "top"]],
+        unsteady=True, time_scheme=time_scheme, dt=dt, t_end=4 * dt,
+        inner_iterations=35, inner_tol=1e-10, pressure_tol=1e-7, lanes="off",
+    )
+    solver = SimpleSolver(mesh, case, be)
+    np.testing.assert_array_equal(solver.U, 0.0)
+    sampled_times = []
+
+    def force(centres, time):
+        sampled_times.append(time)
+        source = np.zeros_like(centres)
+        mode = np.sin(2 * np.pi * centres[:, 1]) * np.cos(2 * np.pi * centres[:, 2])
+        source[:, 0] = rho * time * (mode + 0.25)
+        return source
+
+    solver.set_sources(momentum=force)
+    run(solver)
+    times = dt * np.arange(1, 5)
+    np.testing.assert_allclose(sampled_times, times)
+    np.testing.assert_allclose(solver.mom_source.sum(axis=0), 0.0, atol=1e-14)
+
+    # Periodic in y and zero wall-normal derivative at the z symmetry planes.
+    # The cell-centred Fourier mode has this exact finite-volume decay rate.
+    decay = 4 * nu * (ny**2 * np.sin(np.pi / ny)**2 + nz**2 * np.sin(np.pi / nz)**2)
+    previous = older = 0.0
+    for step, time in enumerate(times):
+        if step and time_scheme == "bdf2":
+            amplitude = (dt * time + 2 * previous - 0.5 * older) / (1.5 + dt * decay)
+        else:
+            amplitude = (dt * time + previous) / (1 + dt * decay)
+        previous, older = amplitude, previous
+    _, y, z = solver.cell_centres().T
+    np.testing.assert_allclose(solver.U[:, 0], amplitude * np.sin(2 * np.pi * y) * np.cos(2 * np.pi * z),
+                               rtol=1e-8, atol=1e-11)
+    np.testing.assert_allclose(solver.U[:, 1:], 0.0, atol=1e-11)
+    np.testing.assert_allclose(solver.fv.net_outflow(solver.F, solver.Fb), 0.0, atol=1e-11)
+
+
+def test_turbulent_pressure_is_absorbed_before_the_momentum_predictor():
+    mesh = cartesian_mesh_2d(6, 4)
+    case = UnstructuredCase(turbulence="k-omega-sst", density=2.0, max_iter=1)
+    solver = SimpleSolver(mesh, case, be)
+    solver.turb.k = 1.0 + solver.cell_centres()[:, 0]
+    solver.p = -(2.0 / 3.0) * case.density * solver.turb.k
+    solver.step()
+    np.testing.assert_allclose(solver.U, 0.0, atol=1e-12)
 
 
 def _ghia_err(s):

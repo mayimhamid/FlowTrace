@@ -57,15 +57,15 @@ class CompressibleSST:
             kin[m] = k
             win[m] = rho0 * k / (mu0 * spec.turb_visc_ratio)
         self.k_in, self.w_in = xp.asarray(kin, dtype=s.dtype), xp.asarray(win, dtype=s.dtype)
-        from .solver import WALL
+        from .solver import SLIP, WALL
 
         self.wall_b = s.bcode == WALL
         wb = s.be.to_numpy(self.wall_b)
         wcells = np.unique(s.be.to_numpy(fv.Pb)[wb])
         self.wall_cell = xp.asarray(np.isin(np.arange(s.nc), wcells))
         # initial field: the free-stream values of the first inflow zone
-        inflow = wb == 0
-        k0 = float(kin[inflow & (kin > 0)].max()) if (kin[inflow] > 0).any() else 1e-6
+        inflow = ~wb & (s.be.to_numpy(s.bcode) != SLIP)
+        k0 = float(kin[inflow & (kin > 0)].max()) if (kin[inflow] > 0).any() else 1e-10
         w0 = float(win[inflow & (win > 0)].max()) if (win[inflow] > 0).any() else 1.0
         self.k = xp.full(s.nc, k0, dtype=s.dtype)
         self.w = xp.full(s.nc, w0, dtype=s.dtype)
@@ -99,7 +99,7 @@ class CompressibleSST:
             out = xp.where(self.wall_b, wall_value, out)
         return out
 
-    def update(self, W, grad, dt):
+    def update(self, W, grad, dt, k_max):
         """Advance k and omega one implicit step; returns their scaled RMS updates."""
         s, xp, fv = self.s, self.xp, self.s.fv
         rho = W[:, 0]
@@ -119,16 +119,18 @@ class CompressibleSST:
         F2 = xp.tanh(xp.maximum(2.0 * sk / (BSTAR * w * y), 500.0 * nu / (y * y * w)) ** 2)
         S, div = self._strain(grad)
         bl = lambda u, v: F1 * u + (1.0 - F1) * v  # noqa: E731
-        Pk = self.mut * S * S - (2.0 / 3.0) * rho * k * div
-        Pk = xp.clip(Pk, 0.0, 10.0 * BSTAR * rho * k * w)
+        nut = A1 * k / xp.maximum(A1 * w, S * F2)
+        Pk = rho * (nut * (S * S - (2.0 / 3.0) * div * div) - (2.0 / 3.0) * k * div)
+        Pk = xp.minimum(Pk, 10.0 * BSTAR * rho * k * w)
         cdt = (1.0 - F1) * 2.0 * rho * SW2 * kw / w
-        Pw = bl(G1, G2) * rho * S * S + xp.maximum(cdt, 0.0)
-        k_new = self._step(k, kb, rho, mu + bl(SK1, SK2) * self.mut, Pk, BSTAR * rho * w, dt, wall_dirichlet=True)
-        w_new = self._step(w, wb, rho, mu + bl(SW1, SW2) * self.mut, Pw,
-                           bl(B1, B2) * rho * w + xp.maximum(-cdt, 0.0) / w, dt, wall_dirichlet=False)
+        Pw = bl(G1, G2) * Pk / nut + cdt
+        k_new = self._step(k, kb, rho, mu + bl(SK1, SK2) * self.mut, xp.maximum(Pk, 0.0),
+                           BSTAR * rho * w + xp.maximum(-Pk, 0.0) / k, dt, wall_dirichlet=True)
+        w_new = self._step(w, wb, rho, mu + bl(SW1, SW2) * self.mut, xp.maximum(Pw, 0.0),
+                           bl(B1, B2) * rho * w + xp.maximum(-Pw, 0.0) / w, dt, wall_dirichlet=False)
         w_wall = 60.0 * nu / (B1 * y * y)
         w_new = xp.where(self.wall_cell, w_wall, w_new)
-        k_new = xp.maximum(k_new, self.k_min)
+        k_new = xp.minimum(xp.maximum(k_new, self.k_min), k_max)
         w_new = xp.maximum(w_new, self.w_min)
         rk = float(xp.sqrt(xp.mean((k_new - k) ** 2)) / (xp.max(k_new) + 1e-30))
         rw = float(xp.sqrt(xp.mean(((w_new - w) / w_new) ** 2)))
@@ -136,15 +138,29 @@ class CompressibleSST:
         self.mut = rho * A1 * k_new / xp.maximum(A1 * w_new, S * F2)
         return {"k": rk, "omega": rw}
 
+    def k_diffusion(self, W, kb):
+        """Integrated outward diffusive transport entering the total-energy flux."""
+        s, fv = self.s, self.s.fv
+        P, N, Pb = fv.P, fv.N, fv.Pb
+        mu = s._viscosity(W[:, -1] / (W[:, 0] * s.R))
+        diffusivity = mu + (self.F1 * SK1 + (1.0 - self.F1) * SK2) * self.mut
+        gf, gb = self._diffusion_coefficients(diffusivity, self.wall_b)
+        return gf * (self.k[N] - self.k[P]), gb * (kb - self.k[Pb])
+
+    def _diffusion_coefficients(self, gamma, wall_dirichlet):
+        s, xp, fv = self.s, self.xp, self.s.fv
+        P, N, Pb = fv.P, fv.N, fv.Pb
+        g_f = 0.5 * (gamma[P] + gamma[N]) * s.A_i / s.d_len
+        fixed = wall_dirichlet | (~self.wall_b & (s.mdot_b < 0))
+        g_b = xp.where(fixed, gamma[Pb] * s.A_b / s.db_len, 0.0)
+        return g_f, g_b
+
     def _step(self, phi, phib, rho, gamma, Sc, Sp, dt, wall_dirichlet):
         """Implicit Euler for rho*phi: V rho (phi' - phi)/dt + conv + diff = V (Sc - Sp phi')."""
         s, xp, fv = self.s, self.xp, self.s.fv
         P, N, Pb = fv.P, fv.N, fv.Pb
         m, mb = s.mdot_i, s.mdot_b
-        Ai, Ab = s.A_i, s.A_b
-        g_f = 0.5 * (gamma[P] + gamma[N]) * Ai / s.d_len
-        g_b = xp.where(self.wall_b if wall_dirichlet else xp.zeros_like(self.wall_b), gamma[Pb] * Ab / s.db_len, 0.0)
-        g_b = g_b + xp.where(~self.wall_b & (mb < 0), gamma[Pb] * Ab / s.db_len, 0.0)
+        g_f, g_b = self._diffusion_coefficients(gamma, self.wall_b & wall_dirichlet)
         mp, mn = xp.maximum(m, 0.0), xp.maximum(-m, 0.0)
         # explicit residual (outflow positive)
         flux = m * xp.where(m >= 0, phi[P], phi[N]) - g_f * (phi[N] - phi[P])

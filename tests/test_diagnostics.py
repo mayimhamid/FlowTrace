@@ -89,20 +89,19 @@ def test_solved_system_residual_matches_the_linear_solver():
 
 
 def test_corrected_imbalance_is_the_pressure_correction_residual():
-    """net outflow of the corrected fluxes = m* + A_p p' = -(rhs - A_p p') of A_p p' = -m*."""
+    """Corrected net outflow is the negative of the final Poisson residual."""
     s = _run(_duct(energy=False), 15)
     cap = s._capture
     corrected = s.fv.net_outflow(cap["F"], cap["Fb"])
-    residual = -cap["mass"] - cap["Ap"] @ cap["pp"]
+    residual = cap["pressure_rhs"] - cap["Ap"] @ cap["pp"]
     assert np.abs(corrected + residual).max() <= 1e-12 * np.abs(cap["mass"]).max()
     d = s.diagnostics()
     pc = d["pressure_correction"]
     assert d["continuity"]["corrected"]["abs_l2"] == pytest.approx(pc["abs_l2"], rel=1e-9)
-    # the PCG stopping rule bounds the corrected imbalance by pressure_tol times the predictor one
+    # PCG measures the final residual against the final Poisson right-hand side.
     assert pc["relative_l2"] == pytest.approx(pc["linear_solver"]["reported_residual"], rel=1e-6)
     if pc["linear_solver"]["converged"]:
-        assert d["continuity"]["corrected"]["abs_l2"] <= s.case.pressure_tol * d["continuity"]["predictor"]["abs_l2"] \
-            * (1 + 1e-6)
+        assert d["continuity"]["corrected"]["abs_l2"] <= s.case.pressure_tol * np.linalg.norm(cap["pressure_rhs"]) * (1 + 1e-6)
 
 
 def test_global_boundary_imbalance_is_the_sum_of_cell_imbalances():
@@ -172,7 +171,7 @@ def test_diverging_run_and_stability_guard_rollback_are_flagged():
         mesh = cartesian_mesh_2d(24, 24)
         mesh.nodes[:, 0] = mesh.nodes[:, 0] + mesh.nodes[:, 1]
         case = UnstructuredCase(boundaries={"top": BoundarySpec("wall", velocity=[1.0, 0.0])}, viscosity=0.1,
-                                max_iter=3000, tol=1e-6, backend="numpy", relax_p=relax_p)
+                                max_iter=3000, tol=1e-6, backend="numpy", relax_p=relax_p, n_non_ortho=0)
         return SimpleSolver(mesh, case)
 
     s = sheared(None)  # automatic relaxation: the guard rolls back
@@ -264,7 +263,7 @@ def test_divergence_report_names_the_guard_state_and_the_skew():
         mesh = cartesian_mesh_2d(24, 24)
         mesh.nodes[:, 0] = mesh.nodes[:, 0] + mesh.nodes[:, 1]  # 45 degrees on every face
         case = UnstructuredCase(boundaries={"top": BoundarySpec("wall", velocity=[1.0, 0.0])}, viscosity=0.1,
-                                max_iter=3000, backend="numpy", **kw)
+                                max_iter=3000, backend="numpy", n_non_ortho=0, **kw)
         return SimpleSolver(mesh, case)
 
     def diverge(s):
@@ -307,7 +306,7 @@ def test_job_reports_divergence_and_input_errors_in_one_line(tmp_path):
     mesh = cartesian_mesh_2d(24, 24)
     mesh.nodes[:, 0] = mesh.nodes[:, 0] + mesh.nodes[:, 1]  # 45 degrees on every face
     case = {"boundaries": {"top": {"kind": "wall", "velocity": [1.0, 0.0]}}, "viscosity": 0.1, "max_iter": 3000,
-            "backend": "numpy", "relax_p": 0.8}
+            "backend": "numpy", "relax_p": 0.8, "n_non_ortho": 0}
     hub = EventHub()
     q = hub.subscribe()
     job = Job({"kind": "unstructured", "mesh_id": "m", "case": case}, hub, str(tmp_path), meshes={"m": mesh})

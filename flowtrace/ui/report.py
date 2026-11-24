@@ -433,7 +433,8 @@ def build_report(app, job, image: Optional[str] = None) -> str:
         txt = (f"The incompressible Navier–Stokes equations are discretised with a cell-centred, collocated finite-volume method on "
                f"the unstructured mesh. Pressure–velocity coupling uses the <b>{ESC(algo)}</b> algorithm; face mass fluxes follow Rhie–Chow "
                f"interpolation. Convection is <b>{ESC(case.scheme)}</b> for momentum"
-               + (f" and <b>{ESC(case.scalar_scheme)}</b> for energy and species" if getattr(case, "scalar_scheme", None) else "")
+               + (f" and <b>{ESC(case.scalar_convection)}</b> for energy and species"
+                  if case.scalar_convection != case.scheme else "")
                + "; gradients are least-squares, and the non-orthogonal part of the diffusive flux is treated explicitly. "
                "The pressure correction is solved with an algebraic multigrid preconditioned conjugate gradient method.")
         if case.turbulence == "k-omega-sst":
