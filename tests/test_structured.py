@@ -20,6 +20,29 @@ def run(s, k=10):
     return s
 
 
+def test_max_performance_job_uses_reusable_pressure_factor(tmp_path):
+    from flowtrace.runtime.engine import EventHub, Job
+
+    spec = {
+        "preset": "step", "params": {"re": 400, "n_per_h": 6},
+        "overrides": {"backend": "numpy", "max_steps": 6},
+        "max_performance": True, "autotune": False, "fmg": False,
+    }
+    hub = EventHub()
+    job = Job(spec, hub, str(tmp_path))
+    job.start()
+    job.join(30)
+    assert job.status == "finished", job.error
+    assert job.solver.poisson_method == "direct"
+    assert any(event["level"] == "warn" and "Max Performance" in event["msg"] for event in hub.log)
+
+    case = backward_facing_step(re=400, n_per_h=6, max_steps=6)
+    reference = run(MACSolver(case, backend=be, poisson="mg"))
+    for field, values in job.solver.fields(["x-velocity", "y-velocity"]).items():
+        np.testing.assert_allclose(values, reference.fields([field])[field], atol=1e-8, rtol=0)
+    assert job.solver.max_divergence() < 1e-10
+
+
 def test_taylor_green_second_order():
     errs = []
     for n in (16, 32, 64):

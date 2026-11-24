@@ -591,6 +591,11 @@ function buildSpec() {
 async function run() {
   try {
     const spec = buildSpec();
+    if ($("#maxPerformance").checked) {
+      const warning = "Max Performance can make other apps slow or temporarily unresponsive. Start this simulation?";
+      if (!window.confirm(warning)) return;
+      spec.max_performance = true;
+    }
     resetRunView();
     await post("/api/run", spec);
   } catch (e) { logLine({ level: "error", msg: e.message }); showError(e.message); }
@@ -856,21 +861,59 @@ function draw() {
   drawColorbar(f, cmap);
   if (f) $("#view").setAttribute("aria-label", `${t("fieldImage")} ${f.field}: ${fmt(f.min, 4)} … ${fmt(f.max, 4)}`);
 }
+const structuredSurface = document.createElement("canvas");
+const packedPalettes = new WeakMap();
+let structuredImage, structuredPixels, structuredRaster;
+function packedPalette(cmap) {
+  let packed = packedPalettes.get(cmap);
+  if (!packed) {
+    packed = new Uint32Array(258);
+    const bytes = new Uint8Array(packed.buffer);
+    for (let k = 0; k < 256; k++) {
+      bytes[4 * k] = cmap[3 * k];
+      bytes[4 * k + 1] = cmap[3 * k + 1];
+      bytes[4 * k + 2] = cmap[3 * k + 2];
+      bytes[4 * k + 3] = 255;
+    }
+    bytes.set([40, 46, 56, 255, 0, 0, 0, 255], 1024);
+    packedPalettes.set(cmap, packed);
+  }
+  return packed;
+}
+function colorStructuredPixels(values, nx, ny, lo, hi, palette, pixels) {
+  const scale = hi > lo ? 255 / (hi - lo) : 0;
+  for (let row = 0; row < ny; row++) {
+    const source = row * nx, dest = (ny - 1 - row) * nx;
+    for (let col = 0; col < nx; col++) {
+      const value = values[source + col];
+      const scaled = (value - lo) * scale;
+      let color = 0;
+      if (Number.isNaN(value)) color = 256;
+      else if (Number.isNaN(scaled)) color = 257;
+      else if (scaled >= 255) color = 255;
+      else if (scaled > 0) color = (scaled + 0.5) | 0;
+      pixels[dest + col] = palette[color];
+    }
+  }
+}
 function drawStructured(ctx, W, H, f, cmap) {
   const { nx, ny, lx, ly } = f;
   const vr = viewRect(W, H, lx, ly); S.view = { ...vr, lx, ly, mesh: "structured" };
-  off.width = nx; off.height = ny;
-  const octx = off.getContext("2d"); const img = octx.createImageData(nx, ny);
-  const lo = f.min, hi = f.max, inv = hi > lo ? 255 / (hi - lo) : 0;
-  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
-    const v = f.values[j * nx + i]; const p = 4 * ((ny - 1 - j) * nx + i);
-    if (Number.isNaN(v)) { img.data[p] = 40; img.data[p + 1] = 46; img.data[p + 2] = 56; img.data[p + 3] = 255; continue; }
-    const k = 3 * Math.max(0, Math.min(255, Math.round((v - lo) * inv)));
-    img.data[p] = cmap[k]; img.data[p + 1] = cmap[k + 1]; img.data[p + 2] = cmap[k + 2]; img.data[p + 3] = 255;
+  const octx = structuredSurface.getContext("2d");
+  if (!structuredImage || structuredSurface.width !== nx || structuredSurface.height !== ny) {
+    structuredSurface.width = nx;
+    structuredSurface.height = ny;
+    structuredImage = octx.createImageData(nx, ny);
+    structuredPixels = new Uint32Array(structuredImage.data.buffer);
+    structuredRaster = null;
   }
-  octx.putImageData(img, 0, 0);
+  if (!structuredRaster || structuredRaster.frame !== f || structuredRaster.cmap !== cmap) {
+    colorStructuredPixels(f.values, nx, ny, f.min, f.max, packedPalette(cmap), structuredPixels);
+    octx.putImageData(structuredImage, 0, 0);
+    structuredRaster = { frame: f, cmap };
+  }
   ctx.imageSmoothingEnabled = $("#smooth").checked;
-  ctx.drawImage(off, vr.x, vr.y, vr.w, vr.h);
+  ctx.drawImage(structuredSurface, vr.x, vr.y, vr.w, vr.h);
   ctx.strokeStyle = "#3a4b62"; ctx.lineWidth = 1; ctx.strokeRect(vr.x, vr.y, vr.w, vr.h);
   if ($("#showStream").checked) drawStreamlines(ctx, f, vr);
   if ($("#showVectors").checked) drawVectors(ctx, f, vr);

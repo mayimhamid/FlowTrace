@@ -147,6 +147,8 @@
           </div>
           <div class="card">
             <h3 data-i18n="execution">Execution</h3>
+            <label class="field"><span>Max Performance</span><input id="maxPerformance" type="checkbox" aria-describedby="maxPerformanceHelp"></label>
+            <span id="maxPerformanceHelp" class="muted">Uses the available CPU threads for parallel work. Other apps may slow down or become unresponsive.</span>
             <label class="field"><span data-i18n="backend">Backend</span><select id="backend"><option value="auto" data-i18n="autoBackend">Auto (measure &amp; choose)</option></select></label>
             <label class="field"><span data-i18n="precision">Precision</span><select id="precision"><option value="auto" data-i18n="auto">Auto</option><option value="fp64">FP64</option><option value="fp32">FP32</option></select></label>
             <label class="field"><span data-i18n="ckpt">Checkpoint every (s)</span><input type="number" id="ckpt" value="0" step="5"></label>

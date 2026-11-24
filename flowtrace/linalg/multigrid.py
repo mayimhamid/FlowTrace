@@ -22,7 +22,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
 from ..structured import kernels as _k
-from .krylov import pcg
+from .krylov import KrylovInfo, pcg
 
 
 class _Level:
@@ -101,7 +101,7 @@ class MGPoisson2D:
     """Multigrid-preconditioned CG for the integrated-form operator above."""
 
     def __init__(self, cx, cy, shift, active, backend, coarse_max: int = 1024,
-                 pre: int = 2, post: int = 2):
+                 pre: int = 2, post: int = 2, direct: bool = False):
         self.backend = backend
         xp = self.xp = backend.xp
         dtype = cx.dtype
@@ -121,7 +121,7 @@ class MGPoisson2D:
                               xp.ascontiguousarray(shift), active, jit)]
         while True:
             L = self.levels[-1]
-            if L.nx * L.ny <= coarse_max or L.nx % 2 or L.ny % 2 or min(L.nx, L.ny) < 4:
+            if direct or L.nx * L.ny <= coarse_max or L.nx % 2 or L.ny % 2 or min(L.nx, L.ny) < 4:
                 break
             self.levels.append(L.coarsen())
         self.pre, self.post = pre, post
@@ -130,7 +130,15 @@ class MGPoisson2D:
         has_dirichlet = bool(backend.to_numpy(
             (cx[0, :].sum() + cx[-1, :].sum() + cy[:, 0].sum() + cy[:, -1].sum() + shift.sum())) > 0)
         self.singular = not has_dirichlet
-        if self.singular:
+        self.direct = direct
+        if self.singular and direct:
+            active_indices = np.flatnonzero(backend.to_numpy(active))
+            if not active_indices.size:
+                raise ValueError("pressure solve requires at least one fluid cell")
+            gauge_index = int(active_indices[0])
+            gauge = sp.csc_matrix(([1.0], ([gauge_index], [gauge_index])), shape=A.shape)
+            A = A + gauge
+        elif self.singular:
             eps = 1e-10 * float(abs(A.diagonal()).mean())
             A = A + eps * sp.identity(A.shape[0], format="csc")
         self._coarse = spla.splu(A.tocsc())
@@ -180,6 +188,13 @@ class MGPoisson2D:
         b = b * self.active
         if self.singular:
             b = self.project(b)
+        if self.direct:
+            x = self._coarse_solve(b)
+            if self.singular:
+                x = self.project(x)
+            norm = float(self.xp.linalg.norm(b))
+            residual = float(self.xp.linalg.norm(b - self.apply(x))) / (norm or 1.0)
+            return x, KrylovInfo(0, residual, residual <= tol)
         x, info = pcg(self.apply, b, self.xp, M=self.precondition, x0=x0, tol=tol,
                       maxiter=maxiter, project=self.project if self.singular else None)
         if self.singular:

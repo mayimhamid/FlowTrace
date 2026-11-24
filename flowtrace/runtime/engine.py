@@ -117,7 +117,8 @@ class Job:
         self.plan = None
         self.result = {}
         self.view_field = spec.get("field")
-        self.frame_interval = float(spec.get("frame_interval", 0.25))
+        self.max_performance = spec.get("max_performance") is True
+        self.frame_interval = float(spec.get("frame_interval", 0.125 if self.max_performance else 0.25))
         self.max_frame = int(spec.get("max_frame", 384))
         self._stop = threading.Event()
         self._thread = None
@@ -157,7 +158,20 @@ class Job:
     # ------------------------------------------------------------------
     def _run(self):
         self.started = time.time()
+        previous_threads = None
         try:
+            if self.max_performance:
+                self.log("Max Performance: sustained CPU load can make other apps slow or briefly unresponsive.", "warn")
+                from .. import native
+                from ..structured import kernels
+
+                native.set_threads(native.max_threads())
+                if kernels.HAVE_NUMBA:
+                    import numba
+
+                    previous_threads = numba.get_num_threads()
+                    numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)
+                    self.log(f"Max Performance: up to {numba.get_num_threads()} Numba threads in parallel kernels.")
             if self.kind == "structured":
                 self._run_structured()
             else:
@@ -172,6 +186,8 @@ class Job:
                      "error")
             self.set_status("error", error=self.error)
         finally:
+            if previous_threads is not None:
+                numba.set_num_threads(previous_threads)
             self.finished_at = time.time()
 
     # ---------------- structured (MAC) ----------------
@@ -195,6 +211,10 @@ class Job:
         from ..structured.solver import MACSolver
 
         case = self._structured_case()
+        if (self.max_performance and self.spec.get("mode") != "steady-simplec" and case.poisson == "auto"
+                and case.obstacles and case.left.kind != "periodic" and case.bottom.kind != "periodic"
+                and case.cells <= 65_536):
+            case.poisson = "direct"
         self.case = case
         self.set_status("planning", name=case.name)
         self.progress(0.05, "Reading the case")

@@ -80,7 +80,7 @@ class StructuredCase:
     cfl: float = 0.5
     dt_max: float = 1.0
     implicit_diffusion: object = "auto"  # True | False | "auto" (implicit only if diffusion limits dt)
-    poisson: str = "auto"  # auto | fast | eig | mg
+    poisson: str = "auto"  # auto | fast | eig | mg | direct
     # run control
     t_end: Optional[float] = None
     max_steps: int = 20000

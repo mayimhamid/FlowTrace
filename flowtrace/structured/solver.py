@@ -391,7 +391,7 @@ class MACSolver:
             return SeparableSolver(self._pressure_axes(), self.be, self.dtype, methods="auto")
         if method == "eig":
             return SeparableSolver(self._pressure_axes(), self.be, self.dtype, methods="eig")
-        if method == "mg":
+        if method in ("mg", "direct"):
             if self.per_x or self.per_y:
                 raise ValueError("multigrid pressure solver does not support periodic boundaries yet")
             xp, S = self.xp, self.sides
@@ -402,12 +402,14 @@ class MACSolver:
             cx[-1] = 2 * dy / dx if S["right"].kind == "outlet" else 0.0
             cy[:, 0] = 2 * dx / dy if S["bottom"].kind == "outlet" else 0.0
             cy[:, -1] = 2 * dx / dy if S["top"].kind == "outlet" else 0.0
-            return MGPoisson2D(cx, cy, 0.0, ~self.xp.asarray(self.solid_h), self.be)
+            return MGPoisson2D(cx, cy, 0.0, ~self.xp.asarray(self.solid_h), self.be, direct=method == "direct")
         raise ValueError(f"unknown poisson method {method!r}")
 
     def _build_poisson(self, method):
         self.poisson_timings = {}
-        if self.has_obstacles:
+        if method == "direct" and (self.be.is_gpu or self.nx * self.ny > 65_536):
+            method = "mg" if self.has_obstacles else "auto"
+        if self.has_obstacles and method != "direct":
             method = "mg"
         if method == "auto":
             cands = {"fast": self._make_poisson("fast")}
@@ -427,10 +429,18 @@ class MACSolver:
             method = min(self.poisson_timings, key=self.poisson_timings.get)
             self.poisson = cands[method]
         else:
-            self.poisson = self._make_poisson(method)
+            try:
+                self.poisson = self._make_poisson(method)
+            except RuntimeError:
+                if method != "direct":
+                    raise
+                method = "mg"
+                self.poisson = self._make_poisson(method)
         self.poisson_method = method
         if isinstance(self.poisson, SeparableSolver):
             self.poisson_detail = "+".join(self.poisson.methods)
+        elif method == "direct":
+            self.poisson_detail = "Sparse LU (reused factors)"
         else:
             self.poisson_detail = f"MG-PCG ({self.poisson.n_levels} levels)"
 
